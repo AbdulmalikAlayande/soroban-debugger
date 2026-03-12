@@ -1,16 +1,13 @@
 import {
   DebugSession,
   InitializedEvent,
-  BreakpointEvent,
   StoppedEvent,
-  ExitedEvent,
-  LogOutputEvent,
-  EventEmitter
-} from '@vscode/debugadapter';
+  ExitedEvent} from '@vscode/debugadapter';
 import { DebugProtocol } from '@vscode/debugprotocol';
 import * as readline from 'readline';
 import { DebuggerProcess, DebuggerProcessConfig } from '../cli/debuggerProcess';
-import { DebuggerState, Variable, StackFrame } from './protocol';
+import { DebuggerState, Variable } from './protocol';
+import { LogOutputEvent, LogLevel } from '@vscode/debugadapter/lib/logger';
 
 export class SorobanDebugSession extends DebugSession {
   private debuggerProcess: DebuggerProcess | null = null;
@@ -234,7 +231,7 @@ export class SorobanDebugSession extends DebugSession {
     const stderr = this.debuggerProcess.getErrorStream();
     if (stderr) {
       stderr.on('data', (data: Buffer) => {
-        this.sendEvent(new LogOutputEvent(`${data}\n`));
+        this.sendEvent(new LogOutputEvent(`${data}\n`, LogLevel.Error));
       });
     }
   }
@@ -256,11 +253,11 @@ export class SorobanDebugSession extends DebugSession {
       }
     } catch {
       // Not a JSON event, just log it
-      this.sendEvent(new LogOutputEvent(output + '\n'));
+      this.sendEvent(new LogOutputEvent(output + '\n', LogLevel.Log));
     }
   }
 
-  private async stop(): Promise<void> {
+  public async stop(): Promise<void> {
     if (this.rl) {
       this.rl.close();
       this.rl = null;
