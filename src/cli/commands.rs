@@ -1390,7 +1390,10 @@ pub fn replay(args: ReplayArgs, verbosity: Verbosity) -> Result<()> {
 
 /// Start debug server for remote connections
 pub fn server(args: ServerArgs) -> Result<()> {
-    print_info(format!("Starting remote debug server on port {}", args.port));
+    print_info(format!(
+        "Starting remote debug server on port {}",
+        args.port
+    ));
     if args.token.is_some() {
         print_info("Token authentication enabled");
     } else {

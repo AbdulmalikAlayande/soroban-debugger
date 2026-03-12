@@ -20,7 +20,11 @@ pub struct DebugServer {
 }
 
 impl DebugServer {
-    pub fn new(token: Option<String>, cert_path: Option<&Path>, key_path: Option<&Path>) -> Result<Self> {
+    pub fn new(
+        token: Option<String>,
+        cert_path: Option<&Path>,
+        key_path: Option<&Path>,
+    ) -> Result<Self> {
         let tls_config = if let (Some(cp), Some(kp)) = (cert_path, key_path) {
             Some(load_tls_config(cp, kp)?)
         } else {
@@ -142,26 +146,24 @@ impl DebugServer {
                     success: true,
                     message: "Already authenticated".to_string(),
                 },
-                DebugRequest::LoadContract { contract_path } => {
-                    match fs::read(&contract_path) {
-                        Ok(bytes) => match crate::runtime::executor::ContractExecutor::new(bytes) {
-                            Ok(executor) => {
-                                self.engine = Some(DebuggerEngine::new(executor, Vec::new()));
-                                DebugResponse::ContractLoaded {
-                                    size: fs::metadata(&contract_path)
-                                        .map(|m| m.len() as usize)
-                                        .unwrap_or(0),
-                                }
+                DebugRequest::LoadContract { contract_path } => match fs::read(&contract_path) {
+                    Ok(bytes) => match crate::runtime::executor::ContractExecutor::new(bytes) {
+                        Ok(executor) => {
+                            self.engine = Some(DebuggerEngine::new(executor, Vec::new()));
+                            DebugResponse::ContractLoaded {
+                                size: fs::metadata(&contract_path)
+                                    .map(|m| m.len() as usize)
+                                    .unwrap_or(0),
                             }
-                            Err(e) => DebugResponse::Error {
-                                message: e.to_string(),
-                            },
-                        },
+                        }
                         Err(e) => DebugResponse::Error {
-                            message: format!("Failed to read contract {:?}: {}", contract_path, e),
+                            message: e.to_string(),
                         },
-                    }
-                }
+                    },
+                    Err(e) => DebugResponse::Error {
+                        message: format!("Failed to read contract {:?}: {}", contract_path, e),
+                    },
+                },
                 DebugRequest::Execute { function, args } => match self.engine.as_mut() {
                     Some(engine) => match engine.execute(&function, args.as_deref()) {
                         Ok(res) => DebugResponse::ExecutionResult {
@@ -182,13 +184,16 @@ impl DebugServer {
                 DebugRequest::Step => match self.engine.as_mut() {
                     Some(engine) => match engine.step() {
                         Ok(_) => {
-                            let (current_function, step_count) =
-                                engine.state().lock().map(|state| {
+                            let (current_function, step_count) = engine
+                                .state()
+                                .lock()
+                                .map(|state| {
                                     (
                                         state.current_function().map(|s| s.to_string()),
                                         state.step_count() as u64,
                                     )
-                                }).unwrap_or((None, 0));
+                                })
+                                .unwrap_or((None, 0));
                             DebugResponse::StepResult {
                                 paused: engine.is_paused(),
                                 current_function,
@@ -210,7 +215,7 @@ impl DebugServer {
                             output: None,
                             error: None,
                         },
-                         Err(e) => DebugResponse::ContinueResult {
+                        Err(e) => DebugResponse::ContinueResult {
                             completed: false,
                             output: None,
                             error: Some(e.to_string()),
@@ -337,10 +342,7 @@ impl DebugServer {
                             Ok(snapshot) => match serde_json::to_string(&snapshot) {
                                 Ok(json) => DebugResponse::StorageState { storage_json: json },
                                 Err(e) => DebugResponse::Error {
-                                    message: format!(
-                                        "Failed to serialize storage snapshot: {}",
-                                        e
-                                    ),
+                                    message: format!("Failed to serialize storage snapshot: {}", e),
                                 },
                             },
                             Err(e) => DebugResponse::Error {
