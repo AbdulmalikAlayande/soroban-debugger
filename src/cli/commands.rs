@@ -53,6 +53,15 @@ fn print_verbose(message: impl AsRef<str>) {
     }
 }
 
+fn budget_trend_stats_or_err(records: &[RunHistory]) -> Result<crate::history::BudgetTrendStats> {
+    crate::history::budget_trend_stats(records).ok_or_else(|| {
+        DebuggerError::ExecutionError(
+            "Failed to compute budget trend statistics for the selected dataset".to_string(),
+        )
+        .into()
+    })
+}
+
 #[derive(serde::Serialize)]
 struct DynamicAnalysisMetadata {
     function: String,
@@ -1839,7 +1848,7 @@ pub fn show_budget_trend(contract: Option<&str>, function: Option<&str>) -> Resu
         return Ok(());
     }
 
-    let stats = crate::history::budget_trend_stats(&records).unwrap();
+    let stats = budget_trend_stats_or_err(&records)?;
     let cpu_values: Vec<u64> = records.iter().map(|r| r.cpu_used).collect();
     let mem_values: Vec<u64> = records.iter().map(|r| r.memory_used).collect();
 
@@ -1887,4 +1896,17 @@ pub fn show_budget_trend(contract: Option<&str>, function: Option<&str>) -> Resu
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn budget_trend_stats_or_err_returns_error_instead_of_panicking() {
+        let empty: Vec<RunHistory> = Vec::new();
+        let err = budget_trend_stats_or_err(&empty).unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("Failed to compute budget trend statistics"));
+    }
 }
