@@ -422,7 +422,7 @@ fn analyze_unbounded_iteration_static(wasm_bytes: &[u8]) -> UnboundedStaticSigna
 
         match payload {
             Payload::ImportSection(reader) => {
-                for import in reader.flatten() {
+                for import in reader.into_iter().flatten() {
                     if let wasmparser::TypeRef::Func(_) = import.ty {
                         if is_storage_read_import(import.module, import.name) {
                             storage_import_indices.insert(imported_func_count);
