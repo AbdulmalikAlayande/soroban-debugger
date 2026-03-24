@@ -1,8 +1,9 @@
 use crate::{DebuggerError, Result};
 use serde::{Deserialize, Serialize};
-use std::fs::{self, File};
-use std::io::{BufReader, BufWriter};
+use std::fs::{self, File, OpenOptions};
+use std::io::{BufReader, BufWriter, Write};
 use std::path::PathBuf;
+use std::time::{Duration, SystemTime};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RunHistory {
@@ -15,6 +16,16 @@ pub struct RunHistory {
 
 pub struct HistoryManager {
     file_path: PathBuf,
+}
+
+struct HistoryLockGuard {
+    lock_path: PathBuf,
+}
+
+impl Drop for HistoryLockGuard {
+    fn drop(&mut self) {
+        let _ = fs::remove_file(&self.lock_path);
+    }
 }
 
 impl HistoryManager {
@@ -63,18 +74,40 @@ impl HistoryManager {
 
     /// Append a new record optimizing with BufWriter.
     pub fn append_record(&self, record: RunHistory) -> Result<()> {
+        let _lock = self.acquire_lock()?;
         let mut history = self.load_history()?;
         history.push(record);
-        let file = File::create(&self.file_path).map_err(|e| {
+
+        let tmp_path = self.file_path.with_extension("json.tmp");
+        let file = File::create(&tmp_path).map_err(|e| {
             DebuggerError::FileError(format!(
-                "Failed to create history file {:?}: {}",
+                "Failed to create temp history file {:?}: {}",
+                tmp_path, e
+            ))
+        })?;
+        let mut writer = BufWriter::new(file);
+        serde_json::to_writer_pretty(&mut writer, &history).map_err(|e| {
+            DebuggerError::FileError(format!(
+                "Failed to write history file {:?}: {}",
                 self.file_path, e
             ))
         })?;
-        let writer = BufWriter::new(file);
-        serde_json::to_writer_pretty(writer, &history).map_err(|e| {
+        writer.flush().map_err(|e| {
             DebuggerError::FileError(format!(
-                "Failed to write history file {:?}: {}",
+                "Failed to flush temp history file {:?}: {}",
+                tmp_path, e
+            ))
+        })?;
+        if let Some(file) = writer.into_inner().ok() {
+            let _ = file.sync_all();
+        }
+
+        if self.file_path.exists() {
+            let _ = fs::remove_file(&self.file_path);
+        }
+        fs::rename(&tmp_path, &self.file_path).map_err(|e| {
+            DebuggerError::FileError(format!(
+                "Failed to replace history file {:?}: {}",
                 self.file_path, e
             ))
         })?;
@@ -103,6 +136,50 @@ impl HistoryManager {
             })
             .collect();
         Ok(filtered)
+    }
+
+    fn acquire_lock(&self) -> Result<HistoryLockGuard> {
+        let lock_path = self.file_path.with_extension("lock");
+        let start = SystemTime::now();
+
+        loop {
+            match OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(&lock_path)
+            {
+                Ok(mut f) => {
+                    let _ = writeln!(f, "pid={}", std::process::id());
+                    return Ok(HistoryLockGuard { lock_path });
+                }
+                Err(_) => {
+                    // If a previous process crashed, allow breaking a stale lock after a grace period.
+                    if let Ok(meta) = fs::metadata(&lock_path) {
+                        if let Ok(modified) = meta.modified() {
+                            if modified
+                                .elapsed()
+                                .unwrap_or(Duration::from_secs(0))
+                                .as_secs()
+                                > 30
+                            {
+                                let _ = fs::remove_file(&lock_path);
+                                continue;
+                            }
+                        }
+                    }
+
+                    if start.elapsed().unwrap_or(Duration::from_secs(0)).as_secs() > 5 {
+                        return Err(DebuggerError::FileError(format!(
+                            "Timed out waiting for history lock at {:?}",
+                            lock_path
+                        ))
+                        .into());
+                    }
+
+                    std::thread::sleep(Duration::from_millis(10));
+                }
+            }
+        }
     }
 }
 
@@ -198,6 +275,7 @@ pub fn budget_trend_stats(records: &[RunHistory]) -> Option<BudgetTrendStats> {
 mod tests {
     use super::*;
     use tempfile::NamedTempFile;
+    use tempfile::TempDir;
 
     #[test]
     fn test_regression_detection() {
@@ -246,6 +324,40 @@ mod tests {
     #[test]
     fn budget_trend_stats_empty_returns_none() {
         assert!(budget_trend_stats(&[]).is_none());
+    }
+
+    #[test]
+    fn concurrent_append_preserves_all_records() {
+        let temp = TempDir::new().unwrap();
+        let history_path = temp.path().join("history.json");
+        let manager = std::sync::Arc::new(HistoryManager::with_path(history_path));
+
+        let threads = 16usize;
+        let per_thread = 25usize;
+        let mut handles = Vec::new();
+
+        for t in 0..threads {
+            let manager = std::sync::Arc::clone(&manager);
+            handles.push(std::thread::spawn(move || {
+                for i in 0..per_thread {
+                    let record = RunHistory {
+                        date: format!("t{t}-i{i}"),
+                        contract_hash: "hash".into(),
+                        function: "func".into(),
+                        cpu_used: (t as u64) * 10 + i as u64,
+                        memory_used: (t as u64) * 10 + i as u64,
+                    };
+                    manager.append_record(record).unwrap();
+                }
+            }));
+        }
+
+        for h in handles {
+            h.join().unwrap();
+        }
+
+        let history = manager.load_history().unwrap();
+        assert_eq!(history.len(), threads * per_thread);
     }
 
     #[test]
