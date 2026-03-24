@@ -276,8 +276,10 @@ impl DebugServer {
                     },
                 },
                 DebugRequest::StepOut => match self.engine.as_mut() {
-                    Some(engine) => match engine.step_out() {
-                        Ok(_) => {
+                    Some(engine) => {
+                        // When paused at a function-level breakpoint (pending execution),
+                        // step-out means executing the function to completion.
+                        if let Some(pending) = self.pending_execution.take() {
                             let (current_function, step_count) = engine
                                 .state()
                                 .lock()
@@ -288,17 +290,46 @@ impl DebugServer {
                                     )
                                 })
                                 .unwrap_or((None, 0));
-                            DebugResponse::StepResult {
-                                paused: engine.is_paused(),
-                                current_function,
-                                step_count,
-                                source_location: None,
+                            match engine.execute_without_breakpoints(
+                                &pending.function,
+                                pending.args.as_deref(),
+                            ) {
+                                Ok(_) => DebugResponse::StepResult {
+                                    paused: false,
+                                    current_function,
+                                    step_count,
+                                    source_location: None,
+                                },
+                                Err(e) => DebugResponse::Error {
+                                    message: e.to_string(),
+                                },
+                            }
+                        } else {
+                            match engine.step_out() {
+                                Ok(_) => {
+                                    let (current_function, step_count) = engine
+                                        .state()
+                                        .lock()
+                                        .map(|state| {
+                                            (
+                                                state.current_function().map(|s| s.to_string()),
+                                                state.step_count() as u64,
+                                            )
+                                        })
+                                        .unwrap_or((None, 0));
+                                    DebugResponse::StepResult {
+                                        paused: engine.is_paused(),
+                                        current_function,
+                                        step_count,
+                                        source_location: None,
+                                    }
+                                }
+                                Err(e) => DebugResponse::Error {
+                                    message: e.to_string(),
+                                },
                             }
                         }
-                        Err(e) => DebugResponse::Error {
-                            message: e.to_string(),
-                        },
-                    },
+                    }
                     None => DebugResponse::Error {
                         message: "No contract loaded".to_string(),
                     },
