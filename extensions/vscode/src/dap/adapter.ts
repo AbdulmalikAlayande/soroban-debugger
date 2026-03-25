@@ -1,43 +1,55 @@
-import { 
-  DebugSession, 
-  InitializedEvent, 
-  BreakpointEvent, 
-  StoppedEvent, 
-  ExitedEvent,
-  LogOutputEvent,
-  EventEmitter
-} from '@vscode/debugadapter';
+import {
+  DebugSession,
+  InitializedEvent,
+  StoppedEvent,
+  ExitedEvent} from '@vscode/debugadapter';
 import { DebugProtocol } from '@vscode/debugprotocol';
 import * as readline from 'readline';
 import { DebuggerProcess, DebuggerProcessConfig } from '../cli/debuggerProcess';
-import { DebuggerState, Variable, StackFrame } from './protocol';
+import { DebuggerState, Variable } from './protocol';
+import { VariableStore } from './variableStore';
+import { ResolvedBreakpoint, resolveSourceBreakpoints } from './sourceBreakpoints';
+import { LogOutputEvent, LogLevel } from '@vscode/debugadapter/lib/logger';
+import { LogManager, LogLevel as ManagerLogLevel, LogPhase } from '../debug/logManager';
+
+type LaunchRequestArgs = DebugProtocol.LaunchRequestArguments & DebuggerProcessConfig;
 
 export class SorobanDebugSession extends DebugSession {
+  private logManager: LogManager | undefined;
   private debuggerProcess: DebuggerProcess | null = null;
   private state: DebuggerState = {
     isRunning: false,
     isPaused: false,
     breakpoints: new Map(),
     callStack: [],
-    variables: []
+    storage: {}
   };
-  private variableHandles = new Map<number, any>();
-  private nextVarHandle = 1;
+  private variableStore = new VariableStore();
   private threadId = 1;
-  private rl: readline.Interface | null = null;
+  private outputReaders: readline.Interface[] = [];
+  private hasExecuted = false;
+  private exportedFunctions = new Set<string>();
+  private sourceFunctionBreakpoints = new Map<string, Set<string>>();
+  private functionBreakpointRefCounts = new Map<string, number>();
+  private requestAbortControllers = new Map<number, AbortController>();
+  private refreshAbortController: AbortController | null = null;
+  private refreshGeneration = 0;
 
   protected initializeRequest(
     response: DebugProtocol.InitializeResponse,
     args: DebugProtocol.InitializeRequestArguments
   ): void {
+    this.logManager?.log(ManagerLogLevel.Info, LogPhase.DAP, `InitializeRequest: ${JSON.stringify(args)}`);
     response.body = response.body || {};
     response.body.supportsConfigurationDoneRequest = true;
     response.body.supportsEvaluateForHovers = true;
+    (response.body as any).supportsVariablePaging = true;
+    (response.body as any).supportsCancelRequest = true;
     response.body.supportsSetVariable = false;
     response.body.supportsSetExpression = false;
-    response.body.supportsConditionalBreakpoints = false;
-    response.body.supportsHitConditionalBreakpoints = false;
-    response.body.supportsLogPoints = false;
+    response.body.supportsConditionalBreakpoints = true;
+    response.body.supportsHitConditionalBreakpoints = true;
+    response.body.supportsLogPoints = true;
 
     this.sendResponse(response);
     this.sendEvent(new InitializedEvent());
@@ -45,56 +57,128 @@ export class SorobanDebugSession extends DebugSession {
 
   protected async launchRequest(
     response: DebugProtocol.LaunchResponse,
-    args: DebugProtocol.LaunchRequestArguments & DebuggerProcessConfig
+    args: LaunchRequestArgs
   ): Promise<void> {
+    this.logManager?.log(ManagerLogLevel.Info, LogPhase.DAP, `LaunchRequest: ${JSON.stringify(args)}`);
     try {
+      const preflight = await validateLaunchConfig(args);
+      if (!preflight.ok) {
+        const issue = preflight.issues[0];
+        throw new Error(`${issue.message} Expected: ${issue.expected}`);
+      }
+
       this.debuggerProcess = new DebuggerProcess({
         contractPath: args.contractPath,
         snapshotPath: args.snapshotPath,
         entrypoint: args.entrypoint || 'main',
         args: args.args || [],
-        trace: args.trace || false
-      });
+        trace: args.trace || false,
+        binaryPath: args.binaryPath,
+        port: args.port,
+        token: args.token,
+        requestTimeoutMs: args.requestTimeoutMs,
+        connectTimeoutMs: args.connectTimeoutMs
+      }, this.logManager);
 
       await this.debuggerProcess.start();
       this.state.isRunning = true;
+      this.state.isPaused = false;
+      this.hasExecuted = false;
+      this.variableStore.reset();
+      this.exportedFunctions = await this.debuggerProcess.getContractFunctions();
+      this.backendCapabilities = await this.debuggerProcess.getCapabilities().catch(() => ({
+        conditionalBreakpoints: false,
+        hitConditionalBreakpoints: false,
+        logPoints: false
+      }));
 
       this.attachProcessListeners();
       this.sendResponse(response);
     } catch (error) {
+      const message = error instanceof DebuggerTimeoutError
+        ? `Failed to launch debugger (timeout): ${error.message}\n\nNext steps: ensure the backend process is running, reachable, and not stalled; then retry the session.`
+        : `Failed to launch debugger: ${error}`;
       this.sendErrorResponse(response, {
         id: 1001,
-        format: `Failed to launch debugger: ${error}`,
+        format: message,
         showUser: true
       });
     }
   }
 
-  protected async setBreakpointsRequest(
+  protected async setBreakPointsRequest(
     response: DebugProtocol.SetBreakpointsResponse,
     args: DebugProtocol.SetBreakpointsArguments
   ): Promise<void> {
     const source = args.source.path || args.source.name || '';
     const breakpoints = args.breakpoints || [];
+    const lines = breakpoints.map((bp) => bp.line);
 
-    this.state.breakpoints.set(source, 
-      breakpoints.map((bp, idx) => ({
+    try {
+      const resolved: ResolvedBreakpoint[] = this.debuggerProcess && source
+        ? resolveSourceBreakpoints(source, lines, this.exportedFunctions)
+        : lines.map((line) => ({
+            line,
+            verified: false,
+            message: 'Debugger is not launched or source path is unavailable'
+          }));
+
+      const managedBreakpoints: BreakpointLocation[] = breakpoints.map((bp, index) => {
+        const match = resolved.find((resolvedBreakpoint) => resolvedBreakpoint.line === bp.line);
+        return {
+          id: `${source}:${bp.line}:${bp.column ?? 1}:${index}`,
+          source,
+          line: bp.line,
+          column: bp.column,
+          functionName: match?.functionName,
+          condition: bp.condition,
+          hitCondition: bp.hitCondition,
+          logMessage: bp.logMessage
+        };
+      });
+
+      const syncErrors = await this.syncSourceBreakpoints(
         source,
-        line: bp.line,
-        column: bp.column
-      }))
-    );
+        managedBreakpoints.filter((bp) => {
+          const match = resolved.find((resolvedBreakpoint) => resolvedBreakpoint.line === bp.line);
+          return Boolean(match?.verified && bp.functionName);
+        })
+      );
 
-    response.body = {
-      breakpoints: breakpoints.map(bp => ({
-        verified: true,
-        line: bp.line,
-        column: bp.column,
-        source: args.source
-      }))
-    };
+      this.state.breakpoints.set(source, managedBreakpoints);
+      this.sourceFunctionBreakpoints.set(
+        source,
+        new Set(
+          managedBreakpoints
+            .filter((bp) => Boolean(bp.functionName) && !syncErrors.has(bp.id))
+            .map((bp) => bp.functionName as string)
+        )
+      );
 
-    this.sendResponse(response);
+      response.body = {
+        breakpoints: breakpoints.map((bp) => {
+          const match = resolved.find((resolvedBreakpoint) => resolvedBreakpoint.line === bp.line);
+          const managed = managedBreakpoints.find((candidate) => candidate.line === bp.line);
+          const capabilityMessages = this.describeCapabilityFallback(bp);
+          const syncMessage = managed ? syncErrors.get(managed.id) : undefined;
+          return {
+            verified: (match?.verified ?? false) && !syncMessage,
+            line: bp.line,
+            column: bp.column,
+            source: args.source,
+            message: [match?.message, syncMessage, capabilityMessages].filter(Boolean).join(' ')
+          };
+        })
+      };
+
+      this.sendResponse(response);
+    } catch (error) {
+      this.sendErrorResponse(response, {
+        id: 1003,
+        format: `Failed to resolve breakpoints: ${error}`,
+        showUser: true
+      });
+    }
   }
 
   protected async stackTraceRequest(
@@ -124,11 +208,21 @@ export class SorobanDebugSession extends DebugSession {
     response: DebugProtocol.ScopesResponse,
     args: DebugProtocol.ScopesArguments
   ): Promise<void> {
+    // Rebuild handles each time to reflect the latest paused state.
+    this.variableStore.reset();
+
     const scopes: DebugProtocol.Scope[] = [];
 
-    if (this.state.variables && this.state.variables.length > 0) {
-      const variablesRef = this.nextVarHandle++;
-      this.variableHandles.set(variablesRef, this.state.variables);
+    const argsRef = this.variableStore.createListHandle(this.variableStore.variablesFromArgs(this.state.args));
+    scopes.push({
+      name: 'Arguments',
+      variablesReference: argsRef,
+      expensive: false
+    });
+
+    const storageKeys = this.state.storage ? Object.keys(this.state.storage) : [];
+    if (storageKeys.length > 0) {
+      const variablesRef = this.variableStore.createListHandle(this.variableStore.variablesFromStorage(this.state.storage as Record<string, unknown>));
 
       scopes.push({
         name: 'Storage',
@@ -145,51 +239,178 @@ export class SorobanDebugSession extends DebugSession {
     response: DebugProtocol.VariablesResponse,
     args: DebugProtocol.VariablesArguments
   ): Promise<void> {
-    const variables = this.variableHandles.get(args.variablesReference) || [];
+    const variables = this.variableStore.getVariables(args.variablesReference, {
+      start: (args as any).start as number | undefined,
+      count: (args as any).count as number | undefined
+    });
 
     response.body = {
       variables: variables.map((v: Variable) => ({
         name: v.name,
         value: v.value,
         type: v.type,
-        variablesReference: v.variablesReference || 0
+        variablesReference: v.variablesReference || 0,
+        indexedVariables: v.indexedVariables,
+        namedVariables: v.namedVariables
       }))
     };
 
     this.sendResponse(response);
   }
 
+   protected async evaluateRequest(
+    response: DebugProtocol.EvaluateResponse,
+    args: DebugProtocol.EvaluateArguments
+  ): Promise<void> {
+    const expression = (args.expression || '').trim();
+
+    try {
+      if (this.debuggerProcess && this.state.isPaused) {
+        await this.refreshState();
+      }
+
+      // 1. Check for "magic" variables (local overrides)
+      if (expression === 'args' || expression === 'Arguments') {
+        response.body = {
+          result: this.state.args ?? '(none)',
+          variablesReference: 0
+        };
+        this.sendResponse(response);
+        return;
+      }
+
+      if (expression === 'storage' || expression === 'Storage') {
+        const storageObject = Object.fromEntries(
+          (this.state.variables || []).map((v) => [v.name, v.value])
+        );
+        response.body = {
+          result: JSON.stringify(storageObject),
+          variablesReference: 0
+        };
+        this.sendResponse(response);
+        return;
+      }
+
+      if (expression.startsWith('storage.')) {
+        const key = expression.slice('storage.'.length);
+        const match = (this.state.variables || []).find((v) => v.name === key);
+        if (!match) {
+          throw new Error(`Unknown storage key: ${key}`);
+        }
+        response.body = {
+          result: match.value,
+          variablesReference: 0
+        };
+        this.sendResponse(response);
+        return;
+      }
+
+      // 2. Fall back to backend evaluation if available and paused
+      if (this.debuggerProcess && this.state.isPaused) {
+        const result = await this.debuggerProcess.evaluate(args.expression, args.frameId);
+        response.body = {
+          result: result.result,
+          type: result.type,
+          variablesReference: result.variablesReference
+        };
+        this.sendResponse(response);
+        return;
+      }
+
+      throw new Error('Unsupported expression or debugger not paused. Try `args`, `storage`, or `storage.<key>`.');
+    } catch (error) {
+      if (error instanceof DebuggerTimeoutError) {
+        this.sendErrorResponse(response, {
+          id: 1010,
+          format:
+            `Evaluate timed out (${error.requestType}). The backend may be stalled.\n\n` +
+            `Next steps: restart the debug session; if it persists, verify the backend binary and connectivity.`,
+          showUser: true
+        });
+        return;
+      }
+
+      this.sendErrorResponse(response, {
+        id: 1010,
+        format: `Evaluate failed: ${error}`,
+        showUser: false
+      });
+    }
+  }
+
   protected async continueRequest(
     response: DebugProtocol.ContinueResponse,
     args: DebugProtocol.ContinueArguments
   ): Promise<void> {
-    this.state.isPaused = false;
-    response.body = { allThreadsContinued: true };
-    this.sendResponse(response);
+    try {
+      if (!this.debuggerProcess) {
+        throw new Error('Debugger process is not running');
+      }
+
+      response.body = { allThreadsContinued: true };
+      this.sendResponse(response);
+
+      if (!this.hasExecuted) {
+        await this.runExecution('step');
+        return;
+      }
+
+      const result = await this.debuggerProcess.continueExecution();
+      if (result.output) {
+        this.sendEvent(new LogOutputEvent(`Result: ${result.output}\n`, LogLevel.Log));
+      }
+
+      if (result.paused) {
+        await this.refreshState();
+        this.state.isPaused = true;
+        this.sendEvent(new StoppedEvent('breakpoint', this.threadId));
+        return;
+      }
+
+      this.sendEvent(new ExitedEvent(0));
+      await this.stop();
+    } catch (error) {
+      if (error instanceof DebuggerTimeoutError) {
+        this.sendEvent(new LogOutputEvent(
+          `Debugger request timed out (${error.requestType}). The backend may be stalled or the connection is unhealthy.\n` +
+          `Next steps: restart the debug session; if it persists, verify the backend binary and network connectivity.\n`,
+          LogLevel.Error
+        ));
+        this.sendEvent(new ExitedEvent(1));
+        await this.stop();
+        return;
+      }
+
+      this.sendErrorResponse(response, {
+        id: 1002,
+        format: `Continue failed: ${error}`,
+        showUser: true
+      });
+    }
   }
 
   protected async nextRequest(
     response: DebugProtocol.NextResponse,
     args: DebugProtocol.NextArguments
   ): Promise<void> {
-    this.sendResponse(response);
+    await this.stepOnce(response, 'next');
   }
 
   protected async stepInRequest(
     response: DebugProtocol.StepInResponse,
     args: DebugProtocol.StepInArguments
   ): Promise<void> {
-    this.sendResponse(response);
+    await this.stepOnce(response, 'step in');
   }
 
   protected async stepOutRequest(
     response: DebugProtocol.StepOutResponse,
     args: DebugProtocol.StepOutArguments
   ): Promise<void> {
-    this.sendResponse(response);
+    await this.stepOnce(response, 'step out');
   }
 
-  protected async threadRequest(
+  protected async threadsRequest(
     response: DebugProtocol.ThreadsResponse
   ): Promise<void> {
     response.body = {
@@ -205,6 +426,54 @@ export class SorobanDebugSession extends DebugSession {
     response: DebugProtocol.ConfigurationDoneResponse,
     args: DebugProtocol.ConfigurationDoneArguments
   ): Promise<void> {
+    try {
+      const requestSeq = (response as any).request_seq as number | undefined;
+      const controller = new AbortController();
+      if (typeof requestSeq === 'number') {
+        this.requestAbortControllers.set(requestSeq, controller);
+      }
+
+      const result = await this.debuggerProcess.evaluate(args.expression, args.frameId, {
+        signal: controller.signal
+      });
+      response.body = {
+        result: result.result,
+        type: result.type,
+        variablesReference: result.variablesReference
+      };
+      this.sendResponse(response);
+    } catch (error) {
+      if ((error as any)?.name === 'AbortError' || (error as any)?.name === 'TimeoutError') {
+        this.sendErrorResponse(response, {
+          id: 1006,
+          format: 'Evaluation canceled',
+          showUser: false
+        });
+        return;
+      }
+      this.sendErrorResponse(response, {
+        id: 1009,
+        format: `Configuration failed: ${error}`,
+        showUser: true
+      });
+    } finally {
+      const requestSeq = (response as any).request_seq as number | undefined;
+      if (typeof requestSeq === 'number') {
+        this.requestAbortControllers.delete(requestSeq);
+      }
+    }
+  }
+
+  // VS Code will send a DAP "cancel" request with the requestId (seq) of the request to cancel.
+  // We only support canceling long-running evaluate() calls at the moment.
+  protected cancelRequest(response: any, args: any): void {
+    const requestId = args?.requestId as number | undefined;
+    if (typeof requestId === 'number') {
+      const controller = this.requestAbortControllers.get(requestId);
+      controller?.abort();
+      this.requestAbortControllers.delete(requestId);
+    }
+
     this.sendResponse(response);
   }
 
@@ -212,6 +481,7 @@ export class SorobanDebugSession extends DebugSession {
     response: DebugProtocol.DisconnectResponse,
     args: DebugProtocol.DisconnectArguments
   ): Promise<void> {
+    this.logManager?.log(ManagerLogLevel.Info, LogPhase.DAP, `DisconnectRequest: ${JSON.stringify(args)}`);
     await this.stop();
     this.sendResponse(response);
   }
@@ -221,50 +491,221 @@ export class SorobanDebugSession extends DebugSession {
 
     const stdout = this.debuggerProcess.getOutputStream();
     if (stdout) {
-      this.rl = readline.createInterface({ 
+      const reader = readline.createInterface({
         input: stdout,
-        crlfDelay: Infinity 
+        crlfDelay: Infinity
       });
 
-      this.rl.on('line', (line: string) => {
-        this.handleDebuggerOutput(line);
+      reader.on('line', (line: string) => {
+        this.logManager?.log(ManagerLogLevel.Debug, LogPhase.Backend, line);
+        this.sendEvent(new LogOutputEvent(line + '\n', LogLevel.Log));
       });
+      this.outputReaders.push(reader);
     }
 
     const stderr = this.debuggerProcess.getErrorStream();
     if (stderr) {
-      stderr.on('data', (data: Buffer) => {
-        this.sendEvent(new LogOutputEvent(`${data}\n`));
+      const reader = readline.createInterface({
+        input: stderr,
+        crlfDelay: Infinity
       });
+
+      reader.on('line', (line: string) => {
+        this.logManager?.log(ManagerLogLevel.Error, LogPhase.Backend, line);
+        this.sendEvent(new LogOutputEvent(line + '\n', LogLevel.Error));
+      });
+      this.outputReaders.push(reader);
     }
   }
 
-  private handleDebuggerOutput(output: string): void {
+  private async runExecution(reason: 'step' | 'entry' | 'breakpoint' | 'pause'): Promise<void> {
+    if (!this.debuggerProcess) {
+      throw new Error('Debugger process is not running');
+    }
+
+    const result = await this.debuggerProcess.execute();
+    this.hasExecuted = true;
+    await this.refreshState();
+    if (result.output) {
+      this.sendEvent(new LogOutputEvent(`Result: ${result.output}\n`, LogLevel.Log));
+    }
+
+    if (result.paused) {
+      this.state.isPaused = true;
+      this.sendEvent(new StoppedEvent('breakpoint', this.threadId));
+      return;
+    }
+
+    this.state.isPaused = false;
+    this.sendEvent(new ExitedEvent(0));
+    await this.stop();
+  }
+
+  private async stepOnce(
+    response:
+      | DebugProtocol.NextResponse
+      | DebugProtocol.StepInResponse
+      | DebugProtocol.StepOutResponse,
+    label: string
+  ): Promise<void> {
     try {
-      const event = JSON.parse(output);
-
-      if (event.type === 'breakpoint' || event.type === 'stopped') {
-        this.state.isPaused = true;
-        this.state.callStack = event.stackTrace || [];
-        this.state.variables = event.variables || [];
-
-        this.sendEvent(new StoppedEvent('breakpoint', this.threadId));
-      } else if (event.type === 'continued') {
-        this.state.isPaused = false;
-      } else if (event.type === 'exited') {
-        this.sendEvent(new ExitedEvent(event.exitCode || 0));
+      if (!this.debuggerProcess) {
+        throw new Error('Debugger process is not running');
       }
-    } catch {
-      // Not a JSON event, just log it
-      this.sendEvent(new LogOutputEvent(output + '\n'));
+
+      this.sendResponse(response);
+
+      if (!this.hasExecuted) {
+        await this.runExecution('step');
+        return;
+      }
+
+      let result;
+      if (label === 'next') {
+        result = await this.debuggerProcess.next();
+      } else if (label === 'step in') {
+        result = await this.debuggerProcess.stepIn();
+      } else if (label === 'step out') {
+        result = await this.debuggerProcess.stepOut();
+      } else {
+        result = await this.debuggerProcess.stepIn(); // Fallback
+      }
+
+      if (result.paused) {
+        await this.refreshState();
+        this.state.isPaused = true;
+        this.sendEvent(new StoppedEvent('step', this.threadId));
+        return;
+      }
+
+      this.sendEvent(new ExitedEvent(0));
+      await this.stop();
+    } catch (error) {
+      if (error instanceof DebuggerTimeoutError) {
+        this.sendEvent(new LogOutputEvent(
+          `${label} timed out (${error.requestType}). The backend may be stalled.\n` +
+          `Next steps: restart the debug session.\n`,
+          LogLevel.Error
+        ));
+        this.sendEvent(new ExitedEvent(1));
+        await this.stop();
+        return;
+      }
+
+      this.sendEvent(new LogOutputEvent(`${label} failed: ${error}\n`, LogLevel.Error));
     }
   }
 
-  private async stop(): Promise<void> {
-    if (this.rl) {
-      this.rl.close();
-      this.rl = null;
+  private async syncSourceBreakpoints(
+    source: string,
+    nextBreakpoints: BreakpointLocation[]
+  ): Promise<Map<string, string>> {
+    if (!this.debuggerProcess) {
+      return new Map();
     }
+
+    const previousBreakpoints = this.state.breakpoints.get(source) || [];
+    const errors = new Map<string, string>();
+
+    for (const breakpoint of previousBreakpoints) {
+      await this.debuggerProcess.clearBreakpoint(breakpoint.id);
+    }
+
+    for (const breakpoint of nextBreakpoints) {
+      try {
+        await this.debuggerProcess.setBreakpoint({
+          id: breakpoint.id,
+          functionName: breakpoint.functionName as string,
+          condition: breakpoint.condition,
+          hitCondition: breakpoint.hitCondition,
+          logMessage: breakpoint.logMessage
+        });
+      } catch (error) {
+        errors.set(
+          breakpoint.id,
+          error instanceof Error ? error.message : String(error)
+        );
+      }
+    }
+
+    return errors;
+  }
+
+  private async refreshState(): Promise<void> {
+    if (!this.debuggerProcess) {
+      return;
+    }
+
+    this.refreshAbortController?.abort();
+    const controller = new AbortController();
+    this.refreshAbortController = controller;
+    const generation = (this.refreshGeneration += 1);
+
+    let inspection;
+    let storage;
+    try {
+      [inspection, storage] = await Promise.all([
+        this.debuggerProcess.inspect({ signal: controller.signal }),
+        this.debuggerProcess.getStorage({ signal: controller.signal })
+      ]);
+    } catch (error) {
+      if ((error as any)?.name === 'AbortError' || (error as any)?.name === 'TimeoutError') {
+        return;
+      }
+      throw error;
+    }
+
+    if (controller.signal.aborted || generation !== this.refreshGeneration) {
+      return;
+    }
+
+    this.state.callStack = inspection.callStack.map((frame, index) => {
+      let sourcePath = frame;
+      let line = 1;
+
+      // Try to find the range for the function to resolve the actual source line
+      for (const [sourceFilePath, sourceBpSet] of this.sourceFunctionBreakpoints.entries()) {
+        if (sourceBpSet.has(frame) || sourceFilePath) {
+          sourcePath = sourceFilePath;
+          try {
+            const { parseFunctionRanges } = require('./sourceBreakpoints');
+            const ranges = parseFunctionRanges(sourcePath);
+            const range = ranges.find((r: any) => r.name === frame);
+            if (range) {
+              line = range.startLine;
+            }
+          } catch (e) {
+            // Ignore if parseFunctionRanges fails
+          }
+          break; // Stop looking after the first match
+        }
+      }
+
+      return {
+        id: index + 1,
+        name: frame,
+        source: sourcePath,
+        line: line,
+        column: 1
+      };
+    });
+    this.state.args = inspection.args;
+    this.state.storage = storage;
+  }
+
+  public async stop(): Promise<void> {
+    this.refreshAbortController?.abort();
+    this.refreshAbortController = null;
+
+    for (const controller of this.requestAbortControllers.values()) {
+      controller.abort();
+    }
+    this.requestAbortControllers.clear();
+
+    for (const reader of this.outputReaders) {
+      reader.close();
+    }
+    this.outputReaders = [];
 
     if (this.debuggerProcess) {
       await this.debuggerProcess.stop();
@@ -273,5 +714,26 @@ export class SorobanDebugSession extends DebugSession {
 
     this.state.isRunning = false;
     this.state.isPaused = false;
+    this.state.callStack = [];
+    this.state.storage = {};
+    this.state.args = undefined;
+    this.hasExecuted = false;
+    this.sourceFunctionBreakpoints.clear();
+  }
+
+  private describeCapabilityFallback(bp: DebugProtocol.SourceBreakpoint): string | undefined {
+    const notices: string[] = [];
+
+    if (bp.condition && !this.backendCapabilities.conditionalBreakpoints) {
+      notices.push('Conditional evaluation is unavailable in the current backend.');
+    }
+    if (bp.hitCondition && !this.backendCapabilities.hitConditionalBreakpoints) {
+      notices.push('Hit-count filtering is unavailable in the current backend.');
+    }
+    if (bp.logMessage && !this.backendCapabilities.logPoints) {
+      notices.push('Logpoints are unavailable in the current backend.');
+    }
+
+    return notices.length > 0 ? notices.join(' ') : undefined;
   }
 }

@@ -15,7 +15,7 @@ A Visual Studio Code extension that integrates the Soroban smart contract debugg
 
 - Visual Studio Code 1.75.0 or higher
 - Node.js 18+ (for extension development)
-- Soroban CLI with debugger support
+- `soroban-debug` CLI built from this repository or installed in your PATH
 - Rust toolchain with `wasm32-unknown-unknown` target
 
 ## Installation
@@ -70,7 +70,8 @@ Add the following to your project's `.vscode/launch.json`:
       "snapshotPath": "${workspaceFolder}/snapshot.json",
       "entrypoint": "main",
       "args": [],
-      "trace": false
+      "trace": false,
+      "binaryPath": "${workspaceFolder}/target/debug/soroban-debug"
     }
   ]
 }
@@ -117,6 +118,23 @@ Create a `snapshot.json` file with the initial state for your debugger session. 
 - **trace** (boolean): Enable detailed trace logging for debugging the adapter itself
   - Default: `false`
 
+- **binaryPath** (string): Optional path to the `soroban-debug` binary
+  - Default: resolved from `${workspaceFolder}/target/debug/soroban-debug`, then PATH
+
+- **requestTimeoutMs** (number): Per-request timeout (wire protocol) before failing the session as unhealthy
+  - Default: `30000`
+  - Tip: If you’re debugging on a slower machine/CI, increase this.
+
+- **connectTimeoutMs** (number): Timeout to wait for the backend server to accept connections on startup
+  - Default: `10000`
+
+### Environment Overrides (Advanced)
+
+If you can’t (or don’t want to) set timeouts in `launch.json`, you can also use:
+
+- `SOROBAN_DEBUG_REQUEST_TIMEOUT_MS`
+- `SOROBAN_DEBUG_CONNECT_TIMEOUT_MS`
+
 ## Usage Guide
 
 ### Setting Breakpoints
@@ -132,6 +150,12 @@ When execution is paused:
 1. Open the **Run and Debug** panel (Ctrl+Shift+D)
 2. Expand the **Variables** section to see contract storage state
 3. Hover over variables to see detailed information
+
+#### Large / Nested Values
+
+- Arrays and objects expand lazily and are paginated with an explicit `… show more` entry to avoid freezing the UI.
+- Long string values are truncated with a `(truncated, expand)` hint; expanding reveals the full value.
+- Typed argument annotations like `{"type":"bytes","value":"0x..."}` render as `bytes(n)` previews; expanding shows hex/base64/utf8 details.
 
 ### Using the Call Stack
 
@@ -152,7 +176,57 @@ Use the following keyboard shortcuts:
 - **F5** or **Continue**: Resume execution until the next breakpoint
 - **Shift+F5** or **Stop**: Terminate the debugging session
 
+## Feature Limitations
+
+The VS Code extension exposes a focused subset of the full `soroban-debug` CLI.
+The following features are **not available** in the extension.
+
+### Not supported in the extension
+
+| CLI feature | CLI flag | Workaround |
+|---|---|---|
+| Instruction-level stepping | `--instruction-debug`, `--step-instructions`, `--step-mode [block]` | Use `soroban-debug interactive --instruction-debug` in a terminal |
+| Storage key filtering | `--storage-filter <pattern>` | All storage is shown unfiltered in the Variables panel; filter via CLI |
+| Auth tree display | `--show-auth` | Use `soroban-debug run --show-auth` in a terminal |
+| Batch execution | `--batch-args <file>`, `--repeat N` | Use `soroban-debug run --batch-args` in a terminal |
+| Remote client mode | `soroban-debug remote --remote host:port` | Use CLI; see [Remote Debugging](../../docs/remote-debugging.md) |
+| TLS configuration | `--tls-cert`, `--tls-key` | Use CLI server/remote commands directly |
+| Storage export | `--export-storage <file>` | Use `soroban-debug run --export-storage` in a terminal |
+| Storage import | `--import-storage <file>` | Use `snapshotPath` in `launch.json` for initial state |
+| Event display and filtering | `--show-events`, `--event-filter` | Use `soroban-debug run --show-events` in a terminal |
+| Dry-run mode | `--dry-run` | Use `soroban-debug run --dry-run` in a terminal |
+| Cross-contract mocking | `--mock CONTRACT.fn=value` | Use `soroban-debug run --mock` in a terminal |
+| Conditional breakpoints | (not in CLI either) | Not supported on either surface |
+| Hit-count conditions | (not in CLI either) | Not supported on either surface |
+| Log points | (not in CLI either) | Not supported on either surface |
+| Analysis subcommands | `analyze`, `symbolic`, `optimize`, `profile`, `compare`, `replay`, `upgrade-check`, `scenario` | Use CLI subcommands directly |
+
+### Supported in the extension
+
+| Feature | Details |
+|---|---|
+| Step in / over / out | F11, F10, Shift+F11 |
+| Continue | F5 |
+| Breakpoints | Set by clicking source line; resolves to the enclosing exported function boundary |
+| Variable inspection — storage | Shown in the Variables panel (Storage scope) when paused |
+| Variable inspection — arguments | Shown in the Variables panel (Arguments scope) when paused |
+| Call stack | Up to 50 frames, clickable to navigate to frame source |
+| Expression evaluation | Debug Console when paused; hover evaluation over identifiers |
+
+For the full feature comparison, see [docs/feature-matrix.md](../../docs/feature-matrix.md).
+
+---
+
 ## Advanced Configuration
+
+### Timeouts
+
+To avoid “frozen” sessions when the backend stalls, the extension enforces deterministic timeouts for every backend request.
+
+You can configure timeouts in either place:
+
+- VS Code Settings: `soroban-debugger.requestTimeoutMs`, `soroban-debugger.connectTimeoutMs`
+- `launch.json`: `requestTimeoutMs`, `connectTimeoutMs` (overrides settings)
 
 ### Debugging the Extension Itself
 
@@ -179,6 +253,15 @@ For troubleshooting the Debug Adapter Protocol communication:
 
 Trace output appears in the Debug Console (Ctrl+Shift+U).
 
+### Diagnostic Logging
+
+The extension now maintains persistent, structured logs for all debug sessions. These are invaluable for diagnosing environment-specific failures or backend crashes.
+
+- **Real-time logs**: View the "Soroban Debugger" output channel in the Output panel.
+- **Persistent logs**: Session logs are stored in the extension's global storage directory and rotated when they reach 10MB.
+- **Phased tracking**: Logs are categorized into phases such as `Spawn`, `Connect`, `Auth`, `Load`, and `Execution`.
+- **Privacy**: Authentication tokens are automatically redacted from all log files.
+
 ## Architecture
 
 The extension consists of three main components:
@@ -194,9 +277,9 @@ The extension consists of three main components:
 - Manages debug session state
 
 ### CLI Process Wrapper (src/cli/debuggerProcess.ts)
-- Spawns the soroban-debugger CLI process
-- Manages stdio communication
-- Handles process lifecycle
+- Spawns the `soroban-debug server` process
+- Connects to the remote debug protocol over TCP
+- Handles process lifecycle and request/response transport
 
 ### Protocol Types (src/dap/protocol.ts)
 - TypeScript types for DAP events and commands
@@ -212,7 +295,7 @@ The extension consists of three main components:
 
 ### Debugger fails to start
 
-- Ensure `soroban-debugger` CLI is in your PATH
+- Ensure the `soroban-debug` CLI is in your PATH, or set `binaryPath`
 - Verify contract path points to a valid WASM file
 - Check that snapshot.json exists and is valid JSON
 
@@ -258,7 +341,8 @@ npm run vscode:prepublish
 │   │   └── protocol.ts       # Protocol types and utilities
 │   └── cli/
 │       └── debuggerProcess.ts # CLI process wrapper
-├── test/                      # Test files
+│   ├── test/
+│   │   └── runTest.ts        # Extension smoke test
 ├── package.json              # Extension manifest
 ├── tsconfig.json            # TypeScript configuration
 └── README.md                # This file

@@ -1,117 +1,99 @@
+#![recursion_limit = "256"]
 use clap::{CommandFactory, Parser};
 use clap_complete::generate;
 use soroban_debugger::cli::{Cli, Commands, Verbosity};
 use soroban_debugger::ui::formatter::Formatter;
 use std::io;
-use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
+
+fn verbosity_to_level(v: Verbosity) -> u8 {
+    match v {
+        Verbosity::Quiet => 0,
+        Verbosity::Normal => 1,
+        Verbosity::Verbose => 2,
+    }
+}
 
 fn initialize_tracing(verbosity: Verbosity) {
     let log_level = verbosity.to_log_level();
-    let fallback_filter = format!("soroban_debugger={}", log_level);
+    let env_filter = tracing_subscriber::EnvFilter::try_from_default_env()
+        .unwrap_or_else(|_| format!("soroban_debugger={}", log_level).into());
 
     let use_json = std::env::var("SOROBAN_DEBUG_JSON").is_ok();
 
+    let subscriber = tracing_subscriber::fmt()
+        .with_writer(std::io::stderr)
+        .with_target(true)
+        .with_level(true)
+        .with_env_filter(env_filter);
+
     if use_json {
-        let json_layer = tracing_subscriber::fmt::layer()
-            .json()
-            .with_writer(std::io::stderr)
-            .with_target(true)
-            .with_level(true);
-
-        tracing_subscriber::registry()
-            .with(
-                tracing_subscriber::EnvFilter::try_from_default_env()
-                    .unwrap_or_else(|_| fallback_filter.clone().into()),
-            )
-            .with(json_layer)
-            .init();
+        subscriber.json().init();
     } else {
-        let fmt_layer = tracing_subscriber::fmt::layer()
-            .with_writer(std::io::stderr)
-            .with_target(true)
-            .with_level(true);
-
-        tracing_subscriber::registry()
-            .with(
-                tracing_subscriber::EnvFilter::try_from_default_env()
-                    .unwrap_or_else(|_| fallback_filter.into()),
-            )
-            .with(fmt_layer)
-            .init();
+        subscriber.init();
     }
+}
+
+fn print_deprecation_warning(deprecated_flag: &str, new_flag: &str) {
+    eprintln!(
+        "{}",
+        Formatter::warning(format!(
+            " Flag '{}' is deprecated. Please use '{}' instead.",
+            deprecated_flag, new_flag
+        ))
+    );
 }
 
 fn handle_deprecations(cli: &mut Cli) {
     match &mut cli.command {
         Some(Commands::Run(args)) => {
             if let Some(wasm) = args.wasm.take() {
-                eprintln!("{}", Formatter::warning("Warning: --wasm and --contract-path are deprecated. Please use --contract instead."));
-                args.contract = wasm;
+                print_deprecation_warning("--wasm", "--contract");
+                args.contract = Some(wasm);
             }
             if let Some(snapshot) = args.snapshot.take() {
-                eprintln!(
-                    "{}",
-                    Formatter::warning(
-                        "Warning: --snapshot is deprecated. Please use --network-snapshot instead."
-                    )
-                );
+                print_deprecation_warning("--snapshot", "--network-snapshot");
                 args.network_snapshot = Some(snapshot);
             }
         }
         Some(Commands::Interactive(args)) => {
             if let Some(wasm) = args.wasm.take() {
-                eprintln!("{}", Formatter::warning("Warning: --wasm and --contract-path are deprecated. Please use --contract instead."));
+                print_deprecation_warning("--wasm", "--contract");
                 args.contract = wasm;
             }
             if let Some(snapshot) = args.snapshot.take() {
-                eprintln!(
-                    "{}",
-                    Formatter::warning(
-                        "Warning: --snapshot is deprecated. Please use --network-snapshot instead."
-                    )
-                );
+                print_deprecation_warning("--snapshot", "--network-snapshot");
                 args.network_snapshot = Some(snapshot);
             }
         }
         Some(Commands::Inspect(args)) => {
             if let Some(wasm) = args.wasm.take() {
-                eprintln!("{}", Formatter::warning("Warning: --wasm and --contract-path are deprecated. Please use --contract instead."));
+                print_deprecation_warning("--wasm", "--contract");
                 args.contract = wasm;
             }
         }
         Some(Commands::Optimize(args)) => {
             if let Some(wasm) = args.wasm.take() {
-                eprintln!("{}", Formatter::warning("Warning: --wasm and --contract-path are deprecated. Please use --contract instead."));
+                print_deprecation_warning("--wasm", "--contract");
                 args.contract = wasm;
             }
             if let Some(snapshot) = args.snapshot.take() {
-                eprintln!(
-                    "{}",
-                    Formatter::warning(
-                        "Warning: --snapshot is deprecated. Please use --network-snapshot instead."
-                    )
-                );
+                print_deprecation_warning("--snapshot", "--network-snapshot");
                 args.network_snapshot = Some(snapshot);
             }
         }
         Some(Commands::Profile(args)) => {
             if let Some(wasm) = args.wasm.take() {
-                eprintln!("{}", Formatter::warning("Warning: --wasm and --contract-path are deprecated. Please use --contract instead."));
+                print_deprecation_warning("--wasm", "--contract");
                 args.contract = wasm;
             }
         }
         Some(Commands::Repl(args)) => {
             if let Some(wasm) = args.wasm.take() {
-                eprintln!("{}", Formatter::warning("Warning: --wasm and --contract-path are deprecated. Please use --contract instead."));
+                print_deprecation_warning("--wasm", "--contract");
                 args.contract = wasm;
             }
             if let Some(snapshot) = args.snapshot.take() {
-                eprintln!(
-                    "{}",
-                    Formatter::warning(
-                        "Warning: --snapshot is deprecated. Please use --network-snapshot instead."
-                    )
-                );
+                print_deprecation_warning("--snapshot", "--network-snapshot");
                 args.network_snapshot = Some(snapshot);
             }
         }
@@ -119,14 +101,66 @@ fn handle_deprecations(cli: &mut Cli) {
     }
 }
 
+fn banner_text() -> String {
+    format!(
+        "  ____                  _\n / ___|  ___  _ __ ___ | |__   __ _ _ __\n \\___ \\ / _ \\| '__/ _ \\| '_ \\ / _` | '_ \\\n  ___) | (_) | | | (_) | |_) | (_| | | | |\n |____/ \\___/|_|  \\___/|_.__/ \\__,_|_| |_|  soroban-debugger v{}",
+        env!("CARGO_PKG_VERSION")
+    )
+}
+
+fn print_banner() {
+    println!("{}", banner_text());
+}
+
+fn env_var_disables_banner(value: Option<&str>) -> bool {
+    value.is_some_and(|v| {
+        let trimmed = v.trim();
+        trimmed == "1" || trimmed.eq_ignore_ascii_case("true")
+    })
+}
+
+fn should_show_banner_with(args: &Cli, is_interactive: bool, no_banner_env: Option<&str>) -> bool {
+    is_interactive && !args.no_banner && !env_var_disables_banner(no_banner_env)
+}
+
+fn should_show_banner(args: &Cli) -> bool {
+    let no_banner_env = std::env::var("NO_BANNER").ok();
+    should_show_banner_with(
+        args,
+        atty::is(atty::Stream::Stdout),
+        no_banner_env.as_deref(),
+    )
+}
+
 fn main() -> miette::Result<()> {
     Formatter::configure_colors_from_env();
 
     let mut cli = Cli::parse();
+    if let Some(ref history_file) = cli.history_file {
+        std::env::set_var("SOROBAN_DEBUG_HISTORY_FILE", history_file);
+    }
+    if should_show_banner(&cli) {
+        print_banner();
+    }
     handle_deprecations(&mut cli);
+
+    let run_json_output_requested = matches!(
+        cli.command.as_ref(),
+        Some(Commands::Run(args))
+            if args.output_format == soroban_debugger::cli::args::OutputFormat::Json
+                || args.json
+                || args
+                    .format
+                    .as_deref()
+                    .is_some_and(|f| f.eq_ignore_ascii_case("json"))
+    );
     let verbosity = cli.verbosity();
 
+    Formatter::set_verbosity(verbosity_to_level(verbosity));
     initialize_tracing(verbosity);
+
+    // Load community plugins at startup unless disabled via env var.
+    let _ = soroban_debugger::plugin::registry::init_global_plugin_registry();
 
     let config = soroban_debugger::config::Config::load_or_default();
 
@@ -144,9 +178,7 @@ fn main() -> miette::Result<()> {
         Some(Commands::Optimize(args)) => {
             soroban_debugger::cli::commands::optimize(args, verbosity)
         }
-        Some(Commands::UpgradeCheck(args)) => {
-            soroban_debugger::cli::commands::upgrade_check(args, verbosity)
-        }
+        Some(Commands::UpgradeCheck(args)) => soroban_debugger::cli::commands::upgrade_check(args),
         Some(Commands::Compare(args)) => soroban_debugger::cli::commands::compare(args),
         Some(Commands::Replay(args)) => soroban_debugger::cli::commands::replay(args, verbosity),
         Some(Commands::Completions(args)) => {
@@ -161,12 +193,61 @@ fn main() -> miette::Result<()> {
         Some(Commands::Server(args)) => soroban_debugger::cli::commands::server(args),
         Some(Commands::Remote(args)) => soroban_debugger::cli::commands::remote(args, verbosity),
         Some(Commands::Analyze(args)) => soroban_debugger::cli::commands::analyze(args, verbosity),
+        Some(Commands::Scenario(args)) => {
+            soroban_debugger::cli::commands::scenario(args, verbosity)
+        }
         Some(Commands::Repl(mut args)) => {
             args.merge_config(&config);
             tokio::runtime::Runtime::new()
-                .map_err(|e| miette::miette!(e))?
-                .block_on(soroban_debugger::cli::commands::repl(args))
-                .map_err(|e| miette::miette!(e))
+                .map_err(|e: std::io::Error| miette::miette!(e))
+                .and_then(|rt| rt.block_on(soroban_debugger::cli::commands::repl(args)))
+        }
+        Some(Commands::External(argv)) => {
+            if argv.is_empty() {
+                return Err(miette::miette!("Missing plugin subcommand"));
+            }
+
+            let command = &argv[0];
+            let args = argv[1..].to_vec();
+
+            match soroban_debugger::plugin::registry::execute_global_command(command, &args) {
+                Ok(Some(output)) => {
+                    println!("{}", output);
+                    Ok(())
+                }
+                Ok(None) => {
+                    // If no plugin registered a command, try treating this as a formatter invocation.
+                    if let Ok(Some(formatted)) =
+                        soroban_debugger::plugin::registry::format_global_output(
+                            command,
+                            &args.join(" "),
+                        )
+                    {
+                        println!("{}", formatted);
+                        return Ok(());
+                    }
+
+                    let available = soroban_debugger::plugin::registry::global_commands();
+                    let formatters = soroban_debugger::plugin::registry::global_formatters();
+                    let mut message = format!("Unknown command: '{command}'");
+                    if !available.is_empty() {
+                        message.push_str("\n\nAvailable plugin commands:\n");
+                        for cmd in available {
+                            message.push_str(&format!("  - {}: {}\n", cmd.name, cmd.description));
+                        }
+                    }
+                    if !formatters.is_empty() {
+                        message.push_str("\nAvailable plugin formatters:\n");
+                        for fmt in formatters {
+                            message.push_str(&format!("  - {}\n", fmt.name));
+                        }
+                    }
+                    Err(soroban_debugger::DebuggerError::ExecutionError(message).into())
+                }
+                Err(e) => {
+                    Err(soroban_debugger::DebuggerError::ExecutionError(e.to_string()).into())
+                }
+            }
         }
         None => {
             if let Some(path) = cli.list_functions {
@@ -177,7 +258,7 @@ fn main() -> miette::Result<()> {
                         functions: true,
                         metadata: false,
                         expected_hash: None,
-                        dependency_graph: false,
+                        dependency_graph: None,
                     },
                     verbosity,
                 );
@@ -186,20 +267,87 @@ fn main() -> miette::Result<()> {
                 soroban_debugger::cli::commands::show_budget_trend(
                     cli.trend_contract.as_deref(),
                     cli.trend_function.as_deref(),
+                    soroban_debugger::history::RegressionConfig {
+                        threshold_pct: cli.trend_regression_threshold_pct,
+                        lookback: cli.trend_regression_lookback,
+                        smoothing_window: cli.trend_regression_smoothing,
+                    },
                 )
             } else {
                 let mut cmd = Cli::command();
                 cmd.print_help().map_err(|e| miette::miette!(e))?;
-                println!();
+                tracing::info!("");
                 Ok(())
             }
         }
     };
 
     if let Err(err) = result {
-        eprintln!("{}", Formatter::error(format!("Error: {err:#}")));
+        if run_json_output_requested {
+            let output = soroban_debugger::cli::output::CommandOutput::<()> {
+                status: "error".to_string(),
+                result: None,
+                budget: None,
+                errors: Some(vec![err.to_string()]),
+            };
+            if let Ok(json) = serde_json::to_string_pretty(&output) {
+                println!("{}", json);
+            }
+        }
+        tracing::error!(
+            "{}",
+            Formatter::error(format!("Error handling deprecations: {err:#}"))
+        );
         return Err(err);
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn parse_cli(args: &[&str]) -> Cli {
+        Cli::try_parse_from(args).expect("failed to parse cli args")
+    }
+
+    #[test]
+    fn banner_contains_project_name_and_version() {
+        let banner = banner_text();
+        assert!(banner.contains("soroban-debugger"));
+        assert!(banner.contains(env!("CARGO_PKG_VERSION")));
+    }
+
+    #[test]
+    fn banner_is_max_five_lines_tall() {
+        let banner = banner_text();
+        assert!(banner.lines().count() <= 5);
+    }
+
+    #[test]
+    fn no_banner_flag_suppresses_output() {
+        let args = parse_cli(&["soroban-debug", "--no-banner"]);
+        assert!(!should_show_banner_with(&args, true, None));
+    }
+
+    #[test]
+    fn no_banner_env_var_suppresses_output() {
+        let args = parse_cli(&["soroban-debug"]);
+        assert!(!should_show_banner_with(&args, true, Some("1")));
+        assert!(!should_show_banner_with(&args, true, Some("true")));
+        assert!(!should_show_banner_with(&args, true, Some("TRUE")));
+    }
+
+    #[test]
+    fn non_interactive_output_suppresses_banner() {
+        let args = parse_cli(&["soroban-debug"]);
+        assert!(!should_show_banner_with(&args, false, None));
+    }
+
+    #[test]
+    fn interactive_output_shows_banner_when_not_suppressed() {
+        let args = parse_cli(&["soroban-debug"]);
+        assert!(should_show_banner_with(&args, true, None));
+    }
 }

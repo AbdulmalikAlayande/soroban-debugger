@@ -1,5 +1,8 @@
+#![recursion_limit = "256"]
+
 pub mod analyzer;
 pub mod batch;
+pub mod benchmarks;
 pub mod cli;
 pub mod client;
 pub mod codegen;
@@ -12,13 +15,16 @@ pub mod logging;
 pub mod output;
 pub mod plugin;
 pub mod profiler;
+pub mod protocol;
 pub mod repeat;
 pub mod repl;
 pub mod runtime;
+pub mod scenario;
 pub mod server;
 pub mod simulator;
 pub mod ui;
 pub mod utils;
+
 use miette::Diagnostic;
 
 pub use debugger::engine::DebuggerEngine;
@@ -81,4 +87,11 @@ pub enum DebuggerError {
         help("Check if you have necessary permissions and that the path exists.")
     )]
     FileError(String),
+
+    #[error("Network/transport error: {0}")]
+    #[diagnostic(
+        code(debugger::network_error),
+        help("Check the server address, your internet/lan connection, firewall rules, and whether the remote debug server is running.")
+    )]
+    NetworkError(String),
 }

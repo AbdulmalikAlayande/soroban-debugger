@@ -1,12 +1,15 @@
-use crate::server::protocol::{DebugMessage, DebugRequest, DebugResponse};
+use crate::server::protocol::{
+    DebugMessage, DebugRequest, DebugResponse, PROTOCOL_MAX_VERSION, PROTOCOL_MIN_VERSION,
+};
 use crate::{DebuggerError, Result};
 use std::io::{BufRead, BufReader, Write};
 use std::net::TcpStream;
 use tracing::info;
 
 /// Remote client for connecting to a debug server
+#[derive(Debug)]
 pub struct RemoteClient {
-    stream: TcpStream,
+    stream: BufReader<TcpStream>,
     message_id: u64,
     authenticated: bool,
 }
@@ -16,14 +19,16 @@ impl RemoteClient {
     pub fn connect(addr: &str, token: Option<String>) -> Result<Self> {
         info!("Connecting to debug server at {}", addr);
         let stream = TcpStream::connect(addr).map_err(|e| {
-            DebuggerError::FileError(format!("Failed to connect to {}: {}", addr, e))
+            DebuggerError::NetworkError(format!("Failed to connect to {}: {}", addr, e))
         })?;
 
         let mut client = Self {
-            stream,
+            stream: BufReader::new(stream),
             message_id: 0,
             authenticated: token.is_none(),
         };
+
+        client.handshake("rust-remote-client", env!("CARGO_PKG_VERSION"))?;
 
         // Authenticate if token is provided
         if let Some(token) = token {
@@ -31,6 +36,34 @@ impl RemoteClient {
         }
 
         Ok(client)
+    }
+
+    /// Perform a protocol handshake and verify compatibility.
+    pub fn handshake(&mut self, client_name: &str, client_version: &str) -> Result<u32> {
+        let response = self.send_request(DebugRequest::Handshake {
+            client_name: client_name.to_string(),
+            client_version: client_version.to_string(),
+            protocol_min: PROTOCOL_MIN_VERSION,
+            protocol_max: PROTOCOL_MAX_VERSION,
+        })?;
+
+        match response {
+            DebugResponse::HandshakeAck {
+                selected_version, ..
+            } => Ok(selected_version),
+            DebugResponse::IncompatibleProtocol { message, .. } => {
+                Err(DebuggerError::ExecutionError(format!(
+                    "Incompatible debugger protocol: {}",
+                    message
+                ))
+                .into())
+            }
+            DebugResponse::Error { message } => Err(DebuggerError::ExecutionError(message).into()),
+            _ => Err(
+                DebuggerError::ExecutionError("Unexpected response to Handshake".to_string())
+                    .into(),
+            ),
+        }
     }
 
     /// Authenticate with the server
@@ -46,9 +79,10 @@ impl RemoteClient {
                     info!("Authentication successful");
                     Ok(())
                 } else {
+                    let sanitized = sanitize_auth_message(&message, token);
                     Err(DebuggerError::ExecutionError(format!(
                         "Authentication failed: {}",
-                        message
+                        sanitized
                     ))
                     .into())
                 }
@@ -91,6 +125,7 @@ impl RemoteClient {
                 success,
                 output,
                 error,
+                ..
             } => {
                 if success {
                     Ok(output)
@@ -108,20 +143,57 @@ impl RemoteClient {
         }
     }
 
-    /// Step execution
-    pub fn step(&mut self) -> Result<(bool, Option<String>, u64)> {
-        let response = self.send_request(DebugRequest::Step)?;
+    /// Step into next inline/instruction
+    pub fn step_in(&mut self) -> Result<(bool, Option<String>, u64)> {
+        let response = self.send_request(DebugRequest::StepIn)?;
 
         match response {
             DebugResponse::StepResult {
                 paused,
                 current_function,
                 step_count,
+                ..
+            } => Ok((paused, current_function, step_count)),
+            DebugResponse::Error { message } => Err(DebuggerError::ExecutionError(message).into()),
+            _ => Err(
+                DebuggerError::ExecutionError("Unexpected response to StepIn".to_string()).into(),
+            ),
+        }
+    }
+
+    /// Step over current function
+    pub fn step_over(&mut self) -> Result<(bool, Option<String>, u64)> {
+        let response = self.send_request(DebugRequest::Next)?;
+
+        match response {
+            DebugResponse::StepResult {
+                paused,
+                current_function,
+                step_count,
+                ..
             } => Ok((paused, current_function, step_count)),
             DebugResponse::Error { message } => Err(DebuggerError::ExecutionError(message).into()),
             _ => {
-                Err(DebuggerError::ExecutionError("Unexpected response to Step".to_string()).into())
+                Err(DebuggerError::ExecutionError("Unexpected response to Next".to_string()).into())
             }
+        }
+    }
+
+    /// Step out of current function
+    pub fn step_out(&mut self) -> Result<(bool, Option<String>, u64)> {
+        let response = self.send_request(DebugRequest::StepOut)?;
+
+        match response {
+            DebugResponse::StepResult {
+                paused,
+                current_function,
+                step_count,
+                ..
+            } => Ok((paused, current_function, step_count)),
+            DebugResponse::Error { message } => Err(DebuggerError::ExecutionError(message).into()),
+            _ => Err(
+                DebuggerError::ExecutionError("Unexpected response to StepOut".to_string()).into(),
+            ),
         }
     }
 
@@ -148,6 +220,7 @@ impl RemoteClient {
                 step_count,
                 paused,
                 call_stack,
+                ..
             } => Ok((function, step_count, paused, call_stack)),
             DebugResponse::Error { message } => Err(DebuggerError::ExecutionError(message).into()),
             _ => Err(
@@ -201,9 +274,13 @@ impl RemoteClient {
     }
 
     /// Set a breakpoint
-    pub fn set_breakpoint(&mut self, function: &str) -> Result<()> {
+    pub fn set_breakpoint(&mut self, function: &str, _condition: Option<String>) -> Result<()> {
         let response = self.send_request(DebugRequest::SetBreakpoint {
+            id: function.to_string(),
             function: function.to_string(),
+            condition: None,
+            hit_condition: None,
+            log_message: None,
         })?;
 
         match response {
@@ -222,7 +299,7 @@ impl RemoteClient {
     /// Clear a breakpoint
     pub fn clear_breakpoint(&mut self, function: &str) -> Result<()> {
         let response = self.send_request(DebugRequest::ClearBreakpoint {
-            function: function.to_string(),
+            id: function.to_string(),
         })?;
 
         match response {
@@ -243,7 +320,10 @@ impl RemoteClient {
         let response = self.send_request(DebugRequest::ListBreakpoints)?;
 
         match response {
-            DebugResponse::BreakpointsList { breakpoints } => Ok(breakpoints),
+            DebugResponse::BreakpointsList { breakpoints } => Ok(breakpoints
+                .into_iter()
+                .map(|breakpoint| breakpoint.function)
+                .collect()),
             DebugResponse::Error { message } => Err(DebuggerError::ExecutionError(message).into()),
             _ => Err(DebuggerError::ExecutionError(
                 "Unexpected response to ListBreakpoints".to_string(),
@@ -317,7 +397,9 @@ impl RemoteClient {
         if !self.authenticated
             && !matches!(
                 request,
-                DebugRequest::Authenticate { .. } | DebugRequest::Ping
+                DebugRequest::Handshake { .. }
+                    | DebugRequest::Authenticate { .. }
+                    | DebugRequest::Ping
             )
         {
             return Err(DebuggerError::ExecutionError(
@@ -327,37 +409,177 @@ impl RemoteClient {
         }
 
         self.message_id += 1;
-        let message = DebugMessage::request(self.message_id, request);
+        let expected_id = self.message_id;
+        let message = DebugMessage::request(expected_id, request);
 
         let request_json = serde_json::to_string(&message)
             .map_err(|e| DebuggerError::FileError(format!("Failed to serialize request: {}", e)))?;
 
         // Send request
-        writeln!(self.stream, "{}", request_json)
-            .map_err(|e| DebuggerError::FileError(format!("Failed to write to stream: {}", e)))?;
+        writeln!(self.stream.get_mut(), "{}", request_json).map_err(|e| {
+            DebuggerError::NetworkError(format!("Failed to write to stream: {}", e))
+        })?;
         self.stream
+            .get_mut()
             .flush()
-            .map_err(|e| DebuggerError::FileError(format!("Failed to flush stream: {}", e)))?;
+            .map_err(|e| DebuggerError::NetworkError(format!("Failed to flush stream: {}", e)))?;
 
         // Read response
-        let reader = BufReader::new(&self.stream);
-        let mut lines = reader.lines();
-        let response_line = lines
-            .next()
-            .ok_or_else(|| DebuggerError::FileError("No response from server".to_string()))?
-            .map_err(|e| DebuggerError::FileError(format!("Failed to read response: {}", e)))?;
+        let mut response_line = String::new();
+        let n = self
+            .stream
+            .read_line(&mut response_line)
+            .map_err(|e| DebuggerError::NetworkError(format!("Failed to read response: {}", e)))?;
+        if n == 0 {
+            return Err(DebuggerError::NetworkError("No response from server".to_string()).into());
+        }
 
-        let response_message: DebugMessage = serde_json::from_str(&response_line)
-            .map_err(|e| DebuggerError::FileError(format!("Failed to parse response: {}", e)))?;
-
-        response_message.response.ok_or_else(|| {
-            DebuggerError::FileError("Response message has no response field".to_string()).into()
-        })
+        parse_response_line(expected_id, response_line.trim_end())
     }
+}
+
+fn parse_response_line(expected_id: u64, response_line: &str) -> Result<DebugResponse> {
+    let response_message = DebugMessage::parse(response_line)
+        .map_err(|e| DebuggerError::FileError(format!("Failed to parse response: {}", e)))?;
+
+    if response_message.id != expected_id {
+        return Err(DebuggerError::ExecutionError(format!(
+            "Mismatched response id: expected {} got {}",
+            expected_id, response_message.id
+        ))
+        .into());
+    }
+
+    let response = response_message.response.ok_or_else(|| {
+        DebuggerError::FileError("Response message has no response field".to_string())
+    })?;
+
+    if matches!(response, DebugResponse::Unknown) {
+        return Err(DebuggerError::ExecutionError(
+            "Received unknown response type from server. Try upgrading the client.".to_string(),
+        )
+        .into());
+    }
+
+    Ok(response)
+}
+
+fn sanitize_auth_message(message: &str, token: &str) -> String {
+    if token.is_empty() {
+        return message.to_string();
+    }
+
+    message.replace(token, "<redacted>")
 }
 
 impl Drop for RemoteClient {
     fn drop(&mut self) {
         let _ = self.disconnect();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::server::protocol::DebugResponse;
+    use std::io::{BufRead, BufReader, ErrorKind, Write};
+    use std::net::TcpListener;
+    use std::thread;
+    use std::time::Duration;
+
+    #[test]
+    fn parse_response_line_rejects_mismatched_ids() {
+        let msg = DebugMessage::response(42, DebugResponse::Pong);
+        let line = serde_json::to_string(&msg).unwrap();
+        let err = parse_response_line(7, &line).unwrap_err();
+        assert!(err.to_string().contains("Mismatched response id"));
+    }
+
+    #[test]
+    fn parse_response_line_accepts_matching_ids() {
+        let msg = DebugMessage::response(7, DebugResponse::Pong);
+        let line = serde_json::to_string(&msg).unwrap();
+        let resp = parse_response_line(7, &line).unwrap();
+        assert!(matches!(resp, DebugResponse::Pong));
+    }
+
+    #[test]
+    fn connect_failure_is_network_error_category() {
+        let err = RemoteClient::connect("127.0.0.1:1", None).unwrap_err();
+        assert!(err.to_string().contains("Network/transport error"));
+    }
+
+    #[test]
+    fn reuses_buffered_stream_across_rapid_requests() {
+        let listener = match TcpListener::bind("127.0.0.1:0") {
+            Ok(listener) => listener,
+            Err(err) if err.kind() == ErrorKind::PermissionDenied => return,
+            Err(err) => panic!("bind test listener: {err}"),
+        };
+        let addr = listener.local_addr().expect("listener address");
+
+        let server = thread::spawn(move || {
+            let (stream, _) = listener.accept().expect("accept client");
+            stream
+                .set_read_timeout(Some(Duration::from_secs(3)))
+                .expect("set read timeout");
+
+            let read_stream = stream.try_clone().expect("clone stream for reader");
+            let mut reader = BufReader::new(read_stream);
+            let mut writer = stream;
+
+            for id in 1..=7 {
+                let mut request_line = String::new();
+                let bytes_read = reader.read_line(&mut request_line).expect("read request");
+                assert!(bytes_read > 0, "client closed before request {id}");
+
+                let request: DebugMessage =
+                    serde_json::from_str(&request_line).expect("parse request");
+                assert_eq!(request.id, id);
+
+                let response = match request.request.expect("request payload") {
+                    DebugRequest::Handshake { .. } => DebugMessage::response(
+                        request.id,
+                        DebugResponse::HandshakeAck {
+                            selected_version: PROTOCOL_MAX_VERSION,
+                            server_name: "test-server".to_string(),
+                            server_version: "0.0.0".to_string(),
+                            protocol_min: PROTOCOL_MIN_VERSION,
+                            protocol_max: PROTOCOL_MAX_VERSION,
+                        },
+                    ),
+                    DebugRequest::Ping => DebugMessage::response(request.id, DebugResponse::Pong),
+                    DebugRequest::Disconnect => {
+                        DebugMessage::response(request.id, DebugResponse::Disconnected)
+                    }
+                    other => panic!("unexpected request: {other:?}"),
+                };
+
+                let response_json = serde_json::to_string(&response).expect("serialize response");
+                writer
+                    .write_all(format!("{response_json}\n").as_bytes())
+                    .expect("write response");
+                writer.flush().expect("flush response");
+            }
+        });
+
+        let mut client = RemoteClient::connect(&addr.to_string(), None).expect("connect client");
+
+        for _ in 0..5 {
+            client.ping().expect("ping over persistent stream");
+        }
+
+        client.disconnect().expect("disconnect client");
+        server.join().expect("server thread");
+    }
+
+    #[test]
+    fn sanitize_auth_message_redacts_token_echo() {
+        let sanitized = sanitize_auth_message(
+            "Authentication failed for token super-secret-token",
+            "super-secret-token",
+        );
+        assert!(sanitized.contains("<redacted>"));
+        assert!(!sanitized.contains("super-secret-token"));
     }
 }

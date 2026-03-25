@@ -1,7 +1,10 @@
 use crate::debugger::instruction_pointer::StepMode;
 use crate::runtime::instruction::Instruction;
 use crossterm::style::Stylize;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
+
+/// Verbosity level stored as u8: 0 = Quiet, 1 = Normal, 2 = Verbose
+static VERBOSITY_LEVEL: AtomicU8 = AtomicU8::new(1);
 
 /// Pretty printing utilities for debugger output
 pub struct Formatter;
@@ -180,6 +183,21 @@ impl Formatter {
         Self::configure_colors(!no_color);
     }
 
+    /// Set the global verbosity level (0 = Quiet, 1 = Normal, 2 = Verbose).
+    pub fn set_verbosity(level: u8) {
+        VERBOSITY_LEVEL.store(level, Ordering::Relaxed);
+    }
+
+    /// Returns true when quiet mode is active (only errors and return values).
+    pub fn is_quiet() -> bool {
+        VERBOSITY_LEVEL.load(Ordering::Relaxed) == 0
+    }
+
+    /// Returns true when verbose mode is active (show all internal details).
+    pub fn is_verbose() -> bool {
+        VERBOSITY_LEVEL.load(Ordering::Relaxed) >= 2
+    }
+
     fn apply_color(message: &str, kind: ColorKind) -> String {
         if !COLOR_ENABLED.load(Ordering::Relaxed) {
             return message.to_string();
@@ -191,6 +209,79 @@ impl Formatter {
             ColorKind::Warning => format!("{}", message.yellow()),
             ColorKind::Error => format!("{}", message.red()),
         }
+    }
+
+    pub fn format_compact_u64(value: u64) -> String {
+        const K: u64 = 1_000;
+        const M: u64 = 1_000_000;
+        const B: u64 = 1_000_000_000;
+
+        if value >= B {
+            format!("{:.2}B", value as f64 / B as f64)
+        } else if value >= M {
+            format!("{:.2}M", value as f64 / M as f64)
+        } else if value >= K {
+            format!("{:.2}K", value as f64 / K as f64)
+        } else {
+            value.to_string()
+        }
+    }
+
+    pub fn format_bytes(bytes: u64) -> String {
+        const KB: u64 = 1024;
+        const MB: u64 = 1024 * KB;
+        const GB: u64 = 1024 * MB;
+
+        if bytes >= GB {
+            format!("{:.2} GB", bytes as f64 / GB as f64)
+        } else if bytes >= MB {
+            format!("{:.2} MB", bytes as f64 / MB as f64)
+        } else if bytes >= KB {
+            format!("{:.2} KB", bytes as f64 / KB as f64)
+        } else {
+            format!("{} B", bytes)
+        }
+    }
+
+    /// Render a sparkline for a numeric series (downsampled to `width`).
+    pub fn sparkline(values: &[u64], width: usize) -> String {
+        if values.is_empty() || width == 0 {
+            return String::new();
+        }
+
+        let buckets = width.min(values.len());
+        let mut sampled: Vec<u64> = Vec::with_capacity(buckets);
+
+        if values.len() <= buckets {
+            sampled.extend_from_slice(values);
+        } else {
+            for i in 0..buckets {
+                let start = i * values.len() / buckets;
+                let end = ((i + 1) * values.len() / buckets).max(start + 1);
+                let mut sum: u128 = 0;
+                for v in &values[start..end] {
+                    sum = sum.saturating_add(*v as u128);
+                }
+                sampled.push((sum / (end - start) as u128) as u64);
+            }
+        }
+
+        let min = sampled.iter().copied().min().unwrap_or(0);
+        let max = sampled.iter().copied().max().unwrap_or(min);
+
+        let levels: [char; 8] = ['▁', '▂', '▃', '▄', '▅', '▆', '▇', '█'];
+        if min == max {
+            return std::iter::repeat_n(levels[0], sampled.len()).collect();
+        }
+
+        sampled
+            .into_iter()
+            .map(|v| {
+                let ratio = (v.saturating_sub(min)) as f64 / (max - min) as f64;
+                let idx = (ratio * (levels.len() - 1) as f64).round() as usize;
+                levels[idx.min(levels.len() - 1)]
+            })
+            .collect()
     }
 }
 

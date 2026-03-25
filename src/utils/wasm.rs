@@ -1,10 +1,456 @@
+use crate::analyzer::upgrade::WasmType;
 use crate::{DebuggerError, Result};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
+use std::collections::{BTreeSet, HashMap};
 use std::fs;
 use std::path::Path;
-use wasmparser::{Parser, Payload};
+use wasmparser::{Operator, Parser, Payload, ValType};
+
+// Re-export FunctionSignature for convenience
+pub use crate::analyzer::upgrade::FunctionSignature;
 // ─── existing public API (unchanged) ─────────────────────────────────────────
+
+// ─── arithmetic analysis (new) ────────────────────────────────────────────────
+
+/// Decoded WASM instruction for arithmetic analysis.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WasmInstruction {
+    I32Add,
+    I32Sub,
+    I32Mul,
+    I64Add,
+    I64Sub,
+    I64Mul,
+    If,
+    BrIf,
+    Call,
+    I32Const,
+    Unknown(u8),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CompareKind {
+    Eqz,
+    Eq,
+    Ne,
+    LtS,
+    LtU,
+    GtS,
+    GtU,
+    LeS,
+    LeU,
+    GeS,
+    GeU,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BranchKind {
+    If,
+    BrIf,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ArithmeticConfidence {
+    High,
+    Medium,
+    Low,
+}
+
+impl ArithmeticConfidence {
+    pub fn label(&self) -> &'static str {
+        match self {
+            Self::High => "high",
+            Self::Medium => "medium",
+            Self::Low => "low",
+        }
+    }
+
+    pub fn score(&self) -> f32 {
+        match self {
+            Self::High => 0.95,
+            Self::Medium => 0.70,
+            Self::Low => 0.40,
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct ArithmeticOpAnalysis {
+    pub function_index: u32,
+    pub instruction_index: usize,
+    pub offset: usize,
+    pub instruction: WasmInstruction,
+    pub confidence: ArithmeticConfidence,
+    pub rationale: String,
+}
+
+/// Decode a single WASM instruction byte to its instruction type.
+fn decode_instruction(byte: u8) -> WasmInstruction {
+    match byte {
+        0x6A => WasmInstruction::I32Add,
+        0x6B => WasmInstruction::I32Sub,
+        0x6C => WasmInstruction::I32Mul,
+        0x7C => WasmInstruction::I64Add,
+        0x7D => WasmInstruction::I64Sub,
+        0x7E => WasmInstruction::I64Mul,
+        0x04 => WasmInstruction::If,
+        0x0D => WasmInstruction::BrIf,
+        0x10 => WasmInstruction::Call,
+        0x41 => WasmInstruction::I32Const,
+        other => WasmInstruction::Unknown(other),
+    }
+}
+
+/// Parse WASM bytecode into a vector of instructions (single-pass linear scan).
+pub fn parse_instructions(wasm: &[u8]) -> Vec<WasmInstruction> {
+    wasm.iter().map(|b| decode_instruction(*b)).collect()
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum StackValueKind {
+    Unknown,
+    Compare(CompareKind),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct StackValue {
+    arithmetic_dependencies: BTreeSet<usize>,
+    kind: StackValueKind,
+}
+
+impl StackValue {
+    fn unknown() -> Self {
+        Self {
+            arithmetic_dependencies: BTreeSet::new(),
+            kind: StackValueKind::Unknown,
+        }
+    }
+
+    fn from_arithmetic(arithmetic_index: usize) -> Self {
+        let mut arithmetic_dependencies = BTreeSet::new();
+        arithmetic_dependencies.insert(arithmetic_index);
+        Self {
+            arithmetic_dependencies,
+            kind: StackValueKind::Unknown,
+        }
+    }
+
+    fn merge(kind: StackValueKind, inputs: impl IntoIterator<Item = StackValue>) -> Self {
+        let mut arithmetic_dependencies = BTreeSet::new();
+        for value in inputs {
+            arithmetic_dependencies.extend(value.arithmetic_dependencies);
+        }
+        Self {
+            arithmetic_dependencies,
+            kind,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Default)]
+struct ArithmeticObservations {
+    compare_guards: Vec<(CompareKind, BranchKind)>,
+    compares_without_branch: Vec<CompareKind>,
+    direct_branches: Vec<BranchKind>,
+}
+
+pub fn analyze_arithmetic_ops(wasm: &[u8]) -> Result<Vec<ArithmeticOpAnalysis>> {
+    let mut findings = Vec::new();
+    let mut saw_code = false;
+    let mut function_index = 0u32;
+
+    for payload in Parser::new(0).parse_all(wasm) {
+        let payload = match payload {
+            Ok(payload) => payload,
+            Err(_) => {
+                return Ok(analyze_raw_arithmetic_ops(wasm));
+            }
+        };
+
+        if let Payload::CodeSectionEntry(body) = payload {
+            saw_code = true;
+            findings.extend(analyze_function_arithmetic(body, function_index)?);
+            function_index += 1;
+        }
+    }
+
+    if saw_code {
+        Ok(findings)
+    } else {
+        Ok(analyze_raw_arithmetic_ops(wasm))
+    }
+}
+
+fn analyze_function_arithmetic(
+    body: wasmparser::FunctionBody<'_>,
+    function_index: u32,
+) -> Result<Vec<ArithmeticOpAnalysis>> {
+    let mut stack = Vec::<StackValue>::new();
+    let mut locals = HashMap::<u32, StackValue>::new();
+    let mut arithmetic_ops = Vec::<(usize, usize, WasmInstruction)>::new();
+    let mut observations = Vec::<ArithmeticObservations>::new();
+
+    let mut reader = body.get_operators_reader().map_err(|e| {
+        DebuggerError::WasmLoadError(format!("Failed to read function operators: {}", e))
+    })?;
+    let mut instruction_index = 0usize;
+
+    while !reader.eof() {
+        let offset = reader.original_position();
+        let op = reader
+            .read()
+            .map_err(|e| DebuggerError::WasmLoadError(format!("Failed to read operator: {}", e)))?;
+
+        match op {
+            Operator::LocalGet { local_index } => {
+                let value = locals
+                    .get(&local_index)
+                    .cloned()
+                    .unwrap_or_else(StackValue::unknown);
+                stack.push(value);
+            }
+            Operator::LocalSet { local_index } => {
+                let value = stack.pop().unwrap_or_else(StackValue::unknown);
+                locals.insert(local_index, value);
+            }
+            Operator::LocalTee { local_index } => {
+                let value = stack.pop().unwrap_or_else(StackValue::unknown);
+                locals.insert(local_index, value.clone());
+                stack.push(value);
+            }
+            Operator::I32Const { .. } | Operator::I64Const { .. } => {
+                stack.push(StackValue::unknown());
+            }
+            Operator::Drop => {
+                let _ = stack.pop();
+            }
+            Operator::Select => {
+                let _condition = stack.pop();
+                let fallback = stack.pop().unwrap_or_else(StackValue::unknown);
+                let primary = stack.pop().unwrap_or_else(StackValue::unknown);
+                stack.push(StackValue::merge(
+                    StackValueKind::Unknown,
+                    [primary, fallback],
+                ));
+            }
+            Operator::I32Add
+            | Operator::I32Sub
+            | Operator::I32Mul
+            | Operator::I64Add
+            | Operator::I64Sub
+            | Operator::I64Mul => {
+                let _rhs = stack.pop();
+                let _lhs = stack.pop();
+                let arithmetic_index = arithmetic_ops.len();
+                let instruction = match op {
+                    Operator::I32Add => WasmInstruction::I32Add,
+                    Operator::I32Sub => WasmInstruction::I32Sub,
+                    Operator::I32Mul => WasmInstruction::I32Mul,
+                    Operator::I64Add => WasmInstruction::I64Add,
+                    Operator::I64Sub => WasmInstruction::I64Sub,
+                    Operator::I64Mul => WasmInstruction::I64Mul,
+                    _ => unreachable!(),
+                };
+                arithmetic_ops.push((instruction_index, offset, instruction));
+                observations.push(ArithmeticObservations::default());
+                stack.push(StackValue::from_arithmetic(arithmetic_index));
+            }
+            Operator::I32Eqz | Operator::I64Eqz => {
+                let value = stack.pop().unwrap_or_else(StackValue::unknown);
+                note_compare(
+                    &mut observations,
+                    &value.arithmetic_dependencies,
+                    CompareKind::Eqz,
+                );
+                stack.push(StackValue::merge(
+                    StackValueKind::Compare(CompareKind::Eqz),
+                    [value],
+                ));
+            }
+            Operator::I32Eq
+            | Operator::I32Ne
+            | Operator::I32LtS
+            | Operator::I32LtU
+            | Operator::I32GtS
+            | Operator::I32GtU
+            | Operator::I32LeS
+            | Operator::I32LeU
+            | Operator::I32GeS
+            | Operator::I32GeU
+            | Operator::I64Eq
+            | Operator::I64Ne
+            | Operator::I64LtS
+            | Operator::I64LtU
+            | Operator::I64GtS
+            | Operator::I64GtU
+            | Operator::I64LeS
+            | Operator::I64LeU
+            | Operator::I64GeS
+            | Operator::I64GeU => {
+                let rhs = stack.pop().unwrap_or_else(StackValue::unknown);
+                let lhs = stack.pop().unwrap_or_else(StackValue::unknown);
+                let compare_kind = compare_kind(&op).expect("comparison operator expected");
+                let deps = StackValue::merge(StackValueKind::Compare(compare_kind), [lhs, rhs]);
+                note_compare(
+                    &mut observations,
+                    &deps.arithmetic_dependencies,
+                    compare_kind,
+                );
+                stack.push(deps);
+            }
+            Operator::If { .. } => {
+                let condition = stack.pop().unwrap_or_else(StackValue::unknown);
+                note_branch(&mut observations, &condition, BranchKind::If);
+            }
+            Operator::BrIf { .. } => {
+                let condition = stack.pop().unwrap_or_else(StackValue::unknown);
+                note_branch(&mut observations, &condition, BranchKind::BrIf);
+            }
+            _ => {}
+        }
+
+        instruction_index += 1;
+    }
+
+    Ok(arithmetic_ops
+        .into_iter()
+        .enumerate()
+        .filter_map(|(arith_index, (instruction_index, offset, instruction))| {
+            classify_arithmetic_observation(
+                function_index,
+                instruction_index,
+                offset,
+                instruction,
+                &observations[arith_index],
+            )
+        })
+        .collect())
+}
+
+fn note_compare(
+    observations: &mut [ArithmeticObservations],
+    dependencies: &BTreeSet<usize>,
+    compare_kind: CompareKind,
+) {
+    for dependency in dependencies {
+        if let Some(observation) = observations.get_mut(*dependency) {
+            observation.compares_without_branch.push(compare_kind);
+        }
+    }
+}
+
+fn note_branch(
+    observations: &mut [ArithmeticObservations],
+    condition: &StackValue,
+    branch_kind: BranchKind,
+) {
+    for dependency in &condition.arithmetic_dependencies {
+        if let Some(observation) = observations.get_mut(*dependency) {
+            match condition.kind {
+                StackValueKind::Compare(compare_kind) => {
+                    observation.compare_guards.push((compare_kind, branch_kind));
+                    if let Some(position) = observation
+                        .compares_without_branch
+                        .iter()
+                        .position(|kind| *kind == compare_kind)
+                    {
+                        observation.compares_without_branch.remove(position);
+                    }
+                }
+                StackValueKind::Unknown => observation.direct_branches.push(branch_kind),
+            }
+        }
+    }
+}
+
+fn classify_arithmetic_observation(
+    function_index: u32,
+    instruction_index: usize,
+    offset: usize,
+    instruction: WasmInstruction,
+    observation: &ArithmeticObservations,
+) -> Option<ArithmeticOpAnalysis> {
+    if !observation.compare_guards.is_empty() {
+        return None;
+    }
+
+    let (confidence, rationale) = if !observation.direct_branches.is_empty() {
+        (
+            ArithmeticConfidence::Low,
+            format!(
+                "The arithmetic result influences {:?}, but no recognized compare-and-branch guard was observed.",
+                observation.direct_branches
+            ),
+        )
+    } else if !observation.compares_without_branch.is_empty() {
+        (
+            ArithmeticConfidence::Medium,
+            format!(
+                "The arithmetic result is compared via {:?}, but that comparison does not drive conditional control flow.",
+                observation.compares_without_branch
+            ),
+        )
+    } else {
+        (
+            ArithmeticConfidence::High,
+            "No comparison-derived conditional branch was observed for the arithmetic result."
+                .to_string(),
+        )
+    };
+
+    Some(ArithmeticOpAnalysis {
+        function_index,
+        instruction_index,
+        offset,
+        instruction,
+        confidence,
+        rationale,
+    })
+}
+
+fn compare_kind(op: &Operator<'_>) -> Option<CompareKind> {
+    match op {
+        Operator::I32Eqz | Operator::I64Eqz => Some(CompareKind::Eqz),
+        Operator::I32Eq | Operator::I64Eq => Some(CompareKind::Eq),
+        Operator::I32Ne | Operator::I64Ne => Some(CompareKind::Ne),
+        Operator::I32LtS | Operator::I64LtS => Some(CompareKind::LtS),
+        Operator::I32LtU | Operator::I64LtU => Some(CompareKind::LtU),
+        Operator::I32GtS | Operator::I64GtS => Some(CompareKind::GtS),
+        Operator::I32GtU | Operator::I64GtU => Some(CompareKind::GtU),
+        Operator::I32LeS | Operator::I64LeS => Some(CompareKind::LeS),
+        Operator::I32LeU | Operator::I64LeU => Some(CompareKind::LeU),
+        Operator::I32GeS | Operator::I64GeS => Some(CompareKind::GeS),
+        Operator::I32GeU | Operator::I64GeU => Some(CompareKind::GeU),
+        _ => None,
+    }
+}
+
+fn analyze_raw_arithmetic_ops(wasm: &[u8]) -> Vec<ArithmeticOpAnalysis> {
+    parse_instructions(wasm)
+        .into_iter()
+        .enumerate()
+        .filter(|(_, instruction)| {
+            matches!(
+                instruction,
+                WasmInstruction::I32Add
+                    | WasmInstruction::I32Sub
+                    | WasmInstruction::I32Mul
+                    | WasmInstruction::I64Add
+                    | WasmInstruction::I64Sub
+                    | WasmInstruction::I64Mul
+            )
+        })
+        .map(|(instruction_index, instruction)| ArithmeticOpAnalysis {
+            function_index: 0,
+            instruction_index,
+            offset: instruction_index,
+            instruction,
+            confidence: ArithmeticConfidence::High,
+            rationale: "The input is not a structured WASM module, so no semantic guard analysis was possible.".to_string(),
+        })
+        .collect()
+}
 
 /// Compute the SHA-256 checksum of a WASM binary.
 pub fn compute_checksum(wasm_bytes: &[u8]) -> String {
@@ -139,125 +585,70 @@ pub fn parse_cross_contract_calls(wasm_bytes: &[u8]) -> Result<Vec<CrossContract
     Ok(calls)
 }
 
-/// Get high-level module statistics and section breakdown from a WASM binary.
 pub fn get_module_info(wasm_bytes: &[u8]) -> Result<ModuleInfo> {
     let mut info = ModuleInfo {
         total_size: wasm_bytes.len(),
         ..ModuleInfo::default()
     };
-    let parser = Parser::new(0);
 
-    for payload in parser.parse_all(wasm_bytes) {
+    let mut add_section = |name: String, range: std::ops::Range<usize>| {
+        info.sections.push(WasmSection {
+            name,
+            size: range.end - range.start,
+            offset: range.start,
+        });
+    };
+
+    for payload in Parser::new(0).parse_all(wasm_bytes) {
         let payload = payload
             .map_err(|e| DebuggerError::WasmLoadError(format!("Failed to parse WASM: {}", e)))?;
-        match &payload {
-            Payload::Version { .. } => {}
+        match payload {
             Payload::TypeSection(reader) => {
                 info.type_count = reader.count();
-                info.sections.push(WasmSection {
-                    name: "Type".to_string(),
-                    size: reader.range().end - reader.range().start,
-                    offset: reader.range().start,
-                });
+                add_section("Type".into(), reader.range());
             }
-            Payload::ImportSection(reader) => {
-                info.sections.push(WasmSection {
-                    name: "Import".to_string(),
-                    size: reader.range().end - reader.range().start,
-                    offset: reader.range().start,
-                });
-            }
+            Payload::ImportSection(reader) => add_section("Import".into(), reader.range()),
             Payload::FunctionSection(reader) => {
                 info.function_count = reader.count();
-                info.sections.push(WasmSection {
-                    name: "Function".to_string(),
-                    size: reader.range().end - reader.range().start,
-                    offset: reader.range().start,
-                });
+                add_section("Function".into(), reader.range());
             }
-            Payload::TableSection(reader) => {
-                info.sections.push(WasmSection {
-                    name: "Table".to_string(),
-                    size: reader.range().end - reader.range().start,
-                    offset: reader.range().start,
-                });
-            }
-            Payload::MemorySection(reader) => {
-                info.sections.push(WasmSection {
-                    name: "Memory".to_string(),
-                    size: reader.range().end - reader.range().start,
-                    offset: reader.range().start,
-                });
-            }
-            Payload::GlobalSection(reader) => {
-                info.sections.push(WasmSection {
-                    name: "Global".to_string(),
-                    size: reader.range().end - reader.range().start,
-                    offset: reader.range().start,
-                });
-            }
+            Payload::TableSection(reader) => add_section("Table".into(), reader.range()),
+            Payload::MemorySection(reader) => add_section("Memory".into(), reader.range()),
+            Payload::GlobalSection(reader) => add_section("Global".into(), reader.range()),
             Payload::ExportSection(reader) => {
                 info.export_count = reader.count();
-                info.sections.push(WasmSection {
-                    name: "Export".to_string(),
-                    size: reader.range().end - reader.range().start,
-                    offset: reader.range().start,
-                });
+                add_section("Export".into(), reader.range());
             }
-            Payload::StartSection { range, .. } => {
-                info.sections.push(WasmSection {
-                    name: "Start".to_string(),
-                    size: range.end - range.start,
-                    offset: range.start,
-                });
-            }
-            Payload::ElementSection(reader) => {
-                info.sections.push(WasmSection {
-                    name: "Element".to_string(),
-                    size: reader.range().end - reader.range().start,
-                    offset: reader.range().start,
-                });
-            }
-            Payload::CodeSectionStart { range, .. } => {
-                info.sections.push(WasmSection {
-                    name: "Code".to_string(),
-                    size: range.end - range.start,
-                    offset: range.start,
-                });
-            }
-            Payload::CodeSectionEntry(reader) => {
-                info.sections.push(WasmSection {
-                    name: "Code (Entry)".to_string(),
-                    size: reader.range().end - reader.range().start,
-                    offset: reader.range().start,
-                });
-            }
-            Payload::DataSection(reader) => {
-                info.sections.push(WasmSection {
-                    name: "Data".to_string(),
-                    size: reader.range().end - reader.range().start,
-                    offset: reader.range().start,
-                });
-            }
-            Payload::DataCountSection { range, .. } => {
-                info.sections.push(WasmSection {
-                    name: "Data Count".to_string(),
-                    size: range.end - range.start,
-                    offset: range.start,
-                });
-            }
+            Payload::StartSection { range, .. } => add_section("Start".into(), range),
+            Payload::ElementSection(reader) => add_section("Element".into(), reader.range()),
+            Payload::CodeSectionStart { range, .. } => add_section("Code".into(), range),
+            Payload::CodeSectionEntry(reader) => add_section("Code (Entry)".into(), reader.range()),
+            Payload::DataSection(reader) => add_section("Data".into(), reader.range()),
+            Payload::DataCountSection { range, .. } => add_section("Data Count".into(), range),
             Payload::CustomSection(reader) => {
-                info.sections.push(WasmSection {
-                    name: format!("Custom ({})", reader.name()),
-                    size: reader.range().end - reader.range().start,
-                    offset: reader.range().start,
-                });
+                add_section(format!("Custom ({})", reader.name()), reader.range())
             }
             _ => {}
         }
     }
 
     Ok(info)
+}
+
+/// Returns the byte range of the WASM code section payload within the module, if present.
+///
+/// This range is suitable for normalizing DWARF line-program addresses that are expressed
+/// as offsets into the code section.
+pub fn code_section_range(wasm_bytes: &[u8]) -> Result<Option<std::ops::Range<usize>>> {
+    for payload in Parser::new(0).parse_all(wasm_bytes) {
+        let payload = payload
+            .map_err(|e| DebuggerError::WasmLoadError(format!("Failed to parse WASM: {}", e)))?;
+        if let Payload::CodeSectionStart { range, .. } = payload {
+            return Ok(Some(range));
+        }
+    }
+
+    Ok(None)
 }
 
 /// Information about a WASM module.
@@ -267,9 +658,11 @@ pub struct ModuleInfo {
     pub type_count: u32,
     pub function_count: u32,
     pub export_count: u32,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
     pub sections: Vec<WasmSection>,
 }
 
+/// Parse full function signatures (name + param types + return types) from WASM
 /// Represents a single section within a WASM binary.
 #[derive(Debug, Serialize, Clone)]
 pub struct WasmSection {
@@ -498,18 +891,27 @@ pub fn extract_contract_metadata(wasm_bytes: &[u8]) -> Result<ContractMetadata> 
 // ─── contract spec / function signatures ─────────────────────────────────────
 
 /// A single function parameter: name and its Soroban type as a display string.
-#[derive(Debug, Clone, PartialEq, Eq)]
+/// A function parameter for a contract spec-level signature.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct FunctionParam {
     pub name: String,
     pub type_name: String,
 }
 
-/// Full signature for one exported contract function.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct FunctionSignature {
+/// A full contract-spec-level signature for one exported contract function.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ContractFunctionSignature {
     pub name: String,
     pub params: Vec<FunctionParam>,
     pub return_type: Option<String>,
+}
+
+/// A custom error definition extracted from a contract spec.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct CustomError {
+    pub code: u32,
+    pub name: String,
+    pub doc: String,
 }
 
 /// Convert an XDR `ScSpecTypeDef` into a human-readable type string.
@@ -569,7 +971,7 @@ fn stringm_to_string(bytes: &[u8]) -> String {
 /// Returns an empty `Vec` (not an error) when no spec section is present —
 /// this keeps callers simple and backward-compatible with contracts that
 /// pre-date the spec section.
-pub fn parse_function_signatures(wasm_bytes: &[u8]) -> Result<Vec<FunctionSignature>> {
+pub fn parse_function_signatures(wasm_bytes: &[u8]) -> Result<Vec<ContractFunctionSignature>> {
     use stellar_xdr::curr::{Limited, Limits, ReadXdr, ScSpecEntry};
 
     let mut signatures = Vec::new();
@@ -607,7 +1009,7 @@ pub fn parse_function_signatures(wasm_bytes: &[u8]) -> Result<Vec<FunctionSignat
 
                     let return_type = func.outputs.first().map(spec_type_to_string);
 
-                    signatures.push(FunctionSignature {
+                    signatures.push(ContractFunctionSignature {
                         name,
                         params,
                         return_type,
@@ -624,6 +1026,71 @@ pub fn parse_function_signatures(wasm_bytes: &[u8]) -> Result<Vec<FunctionSignat
     }
 
     Ok(signatures)
+}
+
+#[allow(dead_code)]
+fn val_type_to_wasm_type(vt: &ValType) -> WasmType {
+    match vt {
+        ValType::I32 => WasmType::I32,
+        ValType::I64 => WasmType::I64,
+        ValType::F32 => WasmType::F32,
+        ValType::F64 => WasmType::F64,
+        ValType::V128 => WasmType::V128,
+        ValType::Ref(rt) => {
+            if rt.is_func_ref() {
+                WasmType::FuncRef
+            } else if rt.is_extern_ref() {
+                WasmType::ExternRef
+            } else {
+                WasmType::Unknown
+            }
+        }
+    }
+}
+/// Parse custom error definitions from the WASM `contractspecv0` custom section.
+pub fn parse_custom_errors(wasm_bytes: &[u8]) -> Result<Vec<CustomError>> {
+    use stellar_xdr::curr::{Limited, Limits, ReadXdr, ScSpecEntry};
+
+    let mut errors = Vec::new();
+    let parser = Parser::new(0);
+
+    for payload in parser.parse_all(wasm_bytes) {
+        let Payload::CustomSection(reader) = payload
+            .map_err(|e| DebuggerError::WasmLoadError(format!("Failed to parse WASM: {}", e)))?
+        else {
+            continue;
+        };
+
+        if reader.name() != "contractspecv0" {
+            continue;
+        }
+
+        let data = reader.data();
+        let cursor = std::io::Cursor::new(data);
+        let mut limited = Limited::new(cursor, Limits::none());
+
+        loop {
+            match ScSpecEntry::read_xdr(&mut limited) {
+                Ok(ScSpecEntry::UdtErrorEnumV0(err_enum)) => {
+                    for case in err_enum.cases.iter() {
+                        errors.push(CustomError {
+                            code: case.value,
+                            name: stringm_to_string(case.name.as_slice()),
+                            doc: stringm_to_string(case.doc.as_slice()),
+                        });
+                    }
+                }
+                Ok(_) => {
+                    // Other spec entries — skip
+                }
+                Err(_) => break, // end of section or corrupt data
+            }
+        }
+
+        break;
+    }
+
+    Ok(errors)
 }
 
 // ─── tests ────────────────────────────────────────────────────────────────────
@@ -924,5 +1391,45 @@ implementation_notes=Line-based format
             ..Default::default()
         };
         assert!(!meta.is_empty());
+    }
+
+    // ── error extraction tests ────────────────────────────────────────────────
+
+    #[test]
+    fn extract_custom_errors() {
+        use stellar_xdr::curr::{
+            ScSpecEntry, ScSpecUdtErrorEnumCaseV0, ScSpecUdtErrorEnumV0, StringM, WriteXdr,
+        };
+
+        let case1 = ScSpecUdtErrorEnumCaseV0 {
+            doc: StringM::try_from("My Error 1".as_bytes().to_vec()).unwrap(),
+            name: StringM::try_from("ErrorOne".as_bytes().to_vec()).unwrap(),
+            value: 100,
+        };
+        let case2 = ScSpecUdtErrorEnumCaseV0 {
+            doc: StringM::try_from("My Error 2".as_bytes().to_vec()).unwrap(),
+            name: StringM::try_from("ErrorTwo".as_bytes().to_vec()).unwrap(),
+            value: 101,
+        };
+        let err_enum = ScSpecUdtErrorEnumV0 {
+            doc: StringM::try_from("".as_bytes().to_vec()).unwrap(),
+            lib: StringM::try_from("".as_bytes().to_vec()).unwrap(),
+            name: StringM::try_from("MyErrorType".as_bytes().to_vec()).unwrap(),
+            cases: vec![case1, case2].try_into().unwrap(),
+        };
+
+        let entry = ScSpecEntry::UdtErrorEnumV0(err_enum);
+        let payload = entry.to_xdr(stellar_xdr::curr::Limits::none()).unwrap();
+
+        let wasm = make_custom_section_wasm("contractspecv0", &payload);
+
+        let errors = parse_custom_errors(&wasm).expect("parsing should succeed");
+        assert_eq!(errors.len(), 2);
+        assert_eq!(errors[0].code, 100);
+        assert_eq!(errors[0].name, "ErrorOne");
+        assert_eq!(errors[0].doc, "My Error 1");
+        assert_eq!(errors[1].code, 101);
+        assert_eq!(errors[1].name, "ErrorTwo");
+        assert_eq!(errors[1].doc, "My Error 2");
     }
 }
