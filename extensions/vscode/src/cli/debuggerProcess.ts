@@ -14,38 +14,13 @@ export interface DebuggerProcessConfig {
   binaryPath?: string;
   port?: number;
   token?: string;
-  requestTimeoutMs?: number;
-  connectTimeoutMs?: number;
-}
-
-export type LaunchPreflightField =
-  | 'binaryPath'
-  | 'contractPath'
-  | 'snapshotPath'
-  | 'entrypoint'
-  | 'args'
-  | 'port'
-  | 'token';
-
-export type LaunchPreflightQuickFix =
-  | 'pickBinary'
-  | 'pickContract'
-  | 'pickSnapshot'
-  | 'openLaunchConfig'
-  | 'generateLaunchConfig'
-  | 'openSettings';
-
-export interface LaunchPreflightIssue {
-  field: LaunchPreflightField;
-  message: string;
-  expected: string;
-  quickFixes: LaunchPreflightQuickFix[];
-}
-
-export interface LaunchPreflightResult {
-  ok: boolean;
-  issues: LaunchPreflightIssue[];
-  resolvedBinaryPath: string;
+  /**
+   * When false, `start()` will only connect to an already-running debugger server
+   * at `port` and will not spawn the CLI process.
+   *
+   * Intended for tests and advanced embedding.
+   */
+  spawnServer?: boolean;
 }
 
 export interface DebuggerExecutionResult {
@@ -147,45 +122,26 @@ type DebugMessage = {
 type PendingRequest = {
   resolve: (response: DebugResponse) => void;
   reject: (error: Error) => void;
+  cleanup: () => void;
 };
 
-export class DebuggerTimeoutError extends Error {
-  readonly requestType: string;
-  readonly timeoutMs: number;
+type RequestOptions = {
+  signal?: AbortSignal;
+  timeoutMs?: number;
+};
 
-  constructor(requestType: string, timeoutMs: number) {
-    super(`Timed out waiting for debugger response to ${requestType} after ${timeoutMs}ms`);
-    this.name = 'DebuggerTimeoutError';
-    this.requestType = requestType;
-    this.timeoutMs = timeoutMs;
+class RequestAbortedError extends Error {
+  name = 'AbortError';
+  constructor(message = 'Request aborted') {
+    super(message);
   }
 }
 
-export function formatProtocolMismatchMessage(details: {
-  extensionVersion: string;
-  backendVersion?: string;
-  backendName?: string;
-  backendProtocolMin?: number;
-  backendProtocolMax?: number;
-  extra?: string;
-}): string {
-  const backendVersion = details.backendVersion || 'unknown';
-  const backendName = details.backendName || 'backend';
-  const backendRange = (details.backendProtocolMin !== undefined && details.backendProtocolMax !== undefined)
-    ? `[${details.backendProtocolMin}..=${details.backendProtocolMax}]`
-    : '(unknown range)';
-
-  const requestedRange = `[${WIRE_PROTOCOL_MIN_VERSION}..=${WIRE_PROTOCOL_MAX_VERSION}]`;
-
-  const lines = [
-    'Incompatible debugger protocol between VS Code extension and backend.',
-    `Extension version: ${details.extensionVersion} (expects protocol ${requestedRange})`,
-    `${backendName} version: ${backendVersion} (supports protocol ${backendRange})`,
-    details.extra ? `Details: ${details.extra}` : undefined,
-    'Remediation: upgrade the older component so both support at least one common protocol version.'
-  ].filter(Boolean);
-
-  return lines.join('\n');
+class RequestTimeoutError extends Error {
+  name = 'TimeoutError';
+  constructor(message = 'Request timed out') {
+    super(message);
+  }
 }
 
 export class DebuggerProcess {
@@ -222,29 +178,29 @@ export class DebuggerProcess {
       return;
     }
 
-    this.logManager?.log(LogLevel.Info, LogPhase.Lifecycle, 'Starting debugger backend process...');
-
-    const binaryPath = resolveDebuggerBinaryPath(this.config);
+    const shouldSpawnServer = this.config.spawnServer !== false;
+    const binaryPath = shouldSpawnServer ? this.resolveBinaryPath() : null;
     const port = this.config.port ?? await this.findAvailablePort();
     this.port = port;
 
-    this.logManager?.log(LogLevel.Info, LogPhase.Spawn, `Spawning backend: ${binaryPath} server --port ${port}`);
+    if (shouldSpawnServer) {
+      const child = spawn(binaryPath as string, this.buildArgs(port), {
+        stdio: ['ignore', 'pipe', 'pipe'],
+        env: {
+          ...process.env,
+          ...(this.config.trace ? { RUST_LOG: 'debug' } : {})
+        }
+      });
+      this.process = child;
 
-    const child = spawn(binaryPath, this.buildArgs(port), {
-      stdio: ['ignore', 'pipe', 'pipe'],
-      env: {
-        ...process.env,
-        ...(this.config.trace ? { RUST_LOG: 'debug' } : {})
-      }
-    });
-    this.childProcess = child;
-
-    try {
       child.once('exit', () => {
         this.rejectPendingRequests(new Error('Debugger server exited'));
         this.socket?.destroy();
         this.socket = null;
       });
+    } else if (!this.config.port) {
+      throw new Error('DebuggerProcessConfig.port is required when spawnServer is false');
+    }
 
       await this.waitForServer(port);
       this.logManager?.log(LogLevel.Info, LogPhase.Connect, `Connecting to debugger server on port ${port}...`);
@@ -338,8 +294,8 @@ export class DebuggerProcess {
     };
   }
 
-  async inspect(): Promise<DebuggerInspection> {
-    const response = await this.sendRequest({ type: 'Inspect' });
+  async inspect(options?: RequestOptions): Promise<DebuggerInspection> {
+    const response = await this.sendRequest({ type: 'Inspect' }, options);
     this.expectResponse(response, 'InspectionResult');
     return {
       function: response.function,
@@ -350,8 +306,8 @@ export class DebuggerProcess {
     };
   }
 
-  async getStorage(): Promise<Record<string, unknown>> {
-    const response = await this.sendRequest({ type: 'GetStorage' });
+  async getStorage(options?: RequestOptions): Promise<Record<string, unknown>> {
+    const response = await this.sendRequest({ type: 'GetStorage' }, options);
     this.expectResponse(response, 'StorageState');
     const parsed = JSON.parse(response.storage_json);
     if (parsed && typeof parsed === 'object') {
@@ -401,12 +357,19 @@ export class DebuggerProcess {
     this.expectResponse(response, 'BreakpointCleared');
   }
 
-  async evaluate(expression: string, frameId?: number): Promise<{ result: string; type?: string; variablesReference: number }> {
-    const response = await this.sendRequest({
-      type: 'Evaluate',
-      expression,
-      frame_id: frameId
-    });
+  async evaluate(
+    expression: string,
+    frameId?: number,
+    options?: RequestOptions
+  ): Promise<{ result: string; type?: string; variablesReference: number }> {
+    const response = await this.sendRequest(
+      {
+        type: 'Evaluate',
+        expression,
+        frame_id: frameId
+      },
+      options
+    );
     this.expectResponse(response, 'EvaluateResult');
     return {
       result: response.result,
@@ -616,17 +579,18 @@ export class DebuggerProcess {
       }
 
       this.pendingRequests.delete(message.id);
-      this.logManager?.log(LogLevel.Debug, LogPhase.Connect, `Backend response [${message.id}]: ${JSON.stringify(message.response)}`);
+      pending.cleanup();
       pending.resolve(message.response);
     }
   }
 
-  private async sendRequest(
-    request: DebugRequest,
-    options: { timeoutMs?: number } = {}
-  ): Promise<DebugResponse> {
+  private async sendRequest(request: DebugRequest, options?: RequestOptions): Promise<DebugResponse> {
     if (!this.socket) {
       throw new Error('Debugger connection is not established');
+    }
+
+    if (options?.signal?.aborted) {
+      throw new RequestAbortedError();
     }
 
     this.requestId += 1;
@@ -634,22 +598,45 @@ export class DebuggerProcess {
     const message: DebugMessage = { id, request };
 
     const responsePromise = new Promise<DebugResponse>((resolve, reject) => {
-      const timeoutMs = options.timeoutMs ?? this.defaultRequestTimeoutMs;
-      const timer = setTimeout(() => {
-        this.pendingRequests.delete(id);
-        reject(new DebuggerTimeoutError(request.type, timeoutMs));
-      }, timeoutMs);
-
-      this.pendingRequests.set(id, {
-        resolve: (response) => {
-          clearTimeout(timer);
-          resolve(response);
-        },
-        reject: (error) => {
-          clearTimeout(timer);
-          reject(error);
+      const cleanup = () => {
+        if (timeout) {
+          clearTimeout(timeout);
+          timeout = undefined;
         }
-      });
+        if (abortHandler && options?.signal) {
+          options.signal.removeEventListener('abort', abortHandler);
+        }
+      };
+
+      let timeout: NodeJS.Timeout | undefined;
+      let abortHandler: (() => void) | undefined;
+
+      if (options?.timeoutMs && options.timeoutMs > 0) {
+        timeout = setTimeout(() => {
+          const pending = this.pendingRequests.get(id);
+          if (!pending) {
+            return;
+          }
+          this.pendingRequests.delete(id);
+          pending.cleanup();
+          pending.reject(new RequestTimeoutError());
+        }, options.timeoutMs);
+      }
+
+      if (options?.signal) {
+        abortHandler = () => {
+          const pending = this.pendingRequests.get(id);
+          if (!pending) {
+            return;
+          }
+          this.pendingRequests.delete(id);
+          pending.cleanup();
+          pending.reject(new RequestAbortedError());
+        };
+        options.signal.addEventListener('abort', abortHandler, { once: true });
+      }
+
+      this.pendingRequests.set(id, { resolve, reject, cleanup });
     });
 
     this.logManager?.log(LogLevel.Debug, LogPhase.Connect, `Backend request [${id}]: ${JSON.stringify(request)}`);
@@ -714,6 +701,7 @@ export class DebuggerProcess {
 
   private rejectPendingRequests(error: Error): void {
     for (const pending of this.pendingRequests.values()) {
+      pending.cleanup();
       pending.reject(error);
     }
     this.pendingRequests.clear();
