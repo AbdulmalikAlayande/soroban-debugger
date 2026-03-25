@@ -25,6 +25,7 @@ pub enum WasmInstruction {
     If,
     BrIf,
     Call,
+    I32Const,
     Unknown(u8),
 }
 
@@ -96,6 +97,7 @@ fn decode_instruction(byte: u8) -> WasmInstruction {
         0x04 => WasmInstruction::If,
         0x0D => WasmInstruction::BrIf,
         0x10 => WasmInstruction::Call,
+        0x41 => WasmInstruction::I32Const,
         other => WasmInstruction::Unknown(other),
     }
 }

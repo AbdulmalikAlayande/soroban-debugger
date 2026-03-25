@@ -28,6 +28,21 @@
   ],
   "main": "./dist/extension.js",
   "contributes": {
+    "configuration": {
+      "title": "Soroban Debugger",
+      "properties": {
+        "soroban-debugger.requestTimeoutMs": {
+          "type": "number",
+          "default": 30000,
+          "description": "Per-request timeout (ms) for backend wire-protocol calls before the debug session fails as unhealthy."
+        },
+        "soroban-debugger.connectTimeoutMs": {
+          "type": "number",
+          "default": 10000,
+          "description": "Timeout (ms) to wait for the backend server to become reachable during launch."
+        }
+      }
+    },
     "debuggers": [
       {
         "type": "soroban",
@@ -80,8 +95,8 @@
               },
               "token": {
                 "type": "string",
-                "description": "Optional single-line authentication token for the debugger server. Use at least 16 characters; prefer a random 32-byte token.",
-                "minLength": 16,
+                "description": "Optional single-line authentication token for the debugger server.",
+                "minLength": 1,
                 "pattern": ".*\\S.*"
               }
             }

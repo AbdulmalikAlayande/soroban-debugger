@@ -1,3 +1,5 @@
+use crate::debugger::engine::{DebuggerEngine, StepOverResult};
+use crate::runtime::executor::ContractExecutor;
 use crate::debugger::engine::DebuggerEngine;
 use crate::debugger::breakpoint::{BreakpointManager, BreakpointSpec};
 use crate::inspector::budget::BudgetInspector;
@@ -93,6 +95,7 @@ impl DebugServer {
         S: tokio::io::AsyncRead + AsyncWriteExt + Unpin,
     {
         let mut authenticated = self.token.is_none();
+        let mut handshake_done = false;
         let (reader, mut writer) = tokio::io::split(stream);
         let mut reader = BufReader::new(reader);
         let mut line = String::new();
@@ -122,6 +125,63 @@ impl DebugServer {
 
             if matches!(request, DebugRequest::Ping) {
                 let response = DebugMessage::response(message.id, DebugResponse::Pong);
+                send_response(&mut writer, response).await?;
+                continue;
+            }
+
+            if let DebugRequest::Handshake {
+                client_name,
+                client_version,
+                protocol_min,
+                protocol_max,
+            } = &request
+            {
+                let server_name = "soroban-debug".to_string();
+                let server_version = env!("CARGO_PKG_VERSION").to_string();
+
+                match negotiate_protocol_version(*protocol_min, *protocol_max) {
+                    Ok(selected_version) => {
+                        handshake_done = true;
+                        let response = DebugMessage::response(
+                            message.id,
+                            DebugResponse::HandshakeAck {
+                                server_name,
+                                server_version,
+                                protocol_min: PROTOCOL_MIN_VERSION,
+                                protocol_max: PROTOCOL_MAX_VERSION,
+                                selected_version,
+                            },
+                        );
+                        send_response(&mut writer, response).await?;
+                        continue;
+                    }
+                    Err(e) => {
+                        let response = DebugMessage::response(
+                            message.id,
+                            DebugResponse::IncompatibleProtocol {
+                                message: format!(
+                                    "{}. Client: {}@{}. Upgrade the older component.",
+                                    e, client_name, client_version
+                                ),
+                                server_name,
+                                server_version,
+                                protocol_min: PROTOCOL_MIN_VERSION,
+                                protocol_max: PROTOCOL_MAX_VERSION,
+                            },
+                        );
+                        send_response(&mut writer, response).await?;
+                        return Ok(());
+                    }
+                }
+            }
+
+            if !handshake_done {
+                let response = DebugMessage::response(
+                    message.id,
+                    DebugResponse::Error {
+                        message: "Protocol handshake required: send a Handshake request before other debug requests.".to_string(),
+                    },
+                );
                 send_response(&mut writer, response).await?;
                 continue;
             }
@@ -384,6 +444,50 @@ impl DebugServer {
                             }
                         }
                     }
+                }
+            }
+
+            DebugRequest::StepOverLine => {
+                if let Some(engine) = &session.engine {
+                    let mut engine = engine.lock().map_err(|e| {
+                        DebuggerError::ExecutionError(format!("Failed to lock engine: {}", e))
+                    })?;
+
+                    match engine.step_over_source_line() {
+                        Ok(StepOverResult { paused, location }) => {
+                            DebugResponse::StepOverLineResult {
+                                paused,
+                                file: location
+                                    .as_ref()
+                                    .map(|l| l.file.to_string_lossy().into_owned()),
+                                line: location.as_ref().map(|l| l.line),
+                                column: location.and_then(|l| l.column),
+                            }
+                        }
+                        Err(e) => DebugResponse::Error {
+                            message: format!("StepOverLine failed: {}", e),
+                        },
+                    }
+                } else {
+                    DebugResponse::Error {
+                        message: "No contract loaded".to_string(),
+                    }
+                }
+            }
+
+            DebugRequest::Continue => {
+                if let Some(engine) = &session.engine {
+                    let mut engine = engine.lock().map_err(|e| {
+                        DebuggerError::ExecutionError(format!("Failed to lock engine: {}", e))
+                    })?;
+
+                    match engine.continue_execution() {
+                        Ok(_) => {
+                            // Execution completed
+                            DebugResponse::ContinueResult {
+                                completed: true,
+                                output: None,
+                                error: None,
                     None => DebugResponse::Error {
                         message: "No contract loaded".to_string(),
                     },
@@ -732,60 +836,6 @@ fn current_storage(engine: &DebuggerEngine) -> Result<std::collections::HashMap<
             (key, value)
         })
         .collect())
-}
-
-fn summarize_request(request: &DebugRequest) -> String {
-    match request {
-        DebugRequest::Authenticate { token } => {
-            format!("Authenticate {{ token: {} }}", redact_secret(token))
-        }
-        DebugRequest::LoadContract { contract_path } => {
-            format!("LoadContract {{ contract_path: {:?} }}", contract_path)
-        }
-        DebugRequest::Execute { function, args } => {
-            format!(
-                "Execute {{ function: {:?}, args_present: {} }}",
-                function,
-                args.is_some()
-            )
-        }
-        DebugRequest::StepIn => "StepIn".to_string(),
-        DebugRequest::Next => "Next".to_string(),
-        DebugRequest::StepOut => "StepOut".to_string(),
-        DebugRequest::Continue => "Continue".to_string(),
-        DebugRequest::Inspect => "Inspect".to_string(),
-        DebugRequest::GetStorage => "GetStorage".to_string(),
-        DebugRequest::GetStack => "GetStack".to_string(),
-        DebugRequest::GetBudget => "GetBudget".to_string(),
-        DebugRequest::SetBreakpoint { id, function, .. } => {
-            format!("SetBreakpoint {{ id: {:?}, function: {:?} }}", id, function)
-        }
-        DebugRequest::ClearBreakpoint { id } => {
-            format!("ClearBreakpoint {{ id: {:?} }}", id)
-        }
-        DebugRequest::ListBreakpoints => "ListBreakpoints".to_string(),
-        DebugRequest::GetCapabilities => "GetCapabilities".to_string(),
-        DebugRequest::SetStorage { .. } => "SetStorage { storage_json: <redacted> }".to_string(),
-        DebugRequest::LoadSnapshot { snapshot_path } => {
-            format!("LoadSnapshot {{ snapshot_path: {:?} }}", snapshot_path)
-        }
-        DebugRequest::Evaluate { expression, frame_id } => {
-            format!(
-                "Evaluate {{ expression: {:?}, frame_id: {:?} }}",
-                expression, frame_id
-            )
-        }
-        DebugRequest::Ping => "Ping".to_string(),
-        DebugRequest::Disconnect => "Disconnect".to_string(),
-    }
-}
-
-fn redact_secret(secret: &str) -> String {
-    if secret.is_empty() {
-        "<redacted:empty>".to_string()
-    } else {
-        format!("<redacted:{} chars>", secret.chars().count())
-    }
 }
 
 fn load_tls_config(cert_path: &Path, key_path: &Path) -> Result<ServerConfig> {
