@@ -1845,6 +1845,15 @@ pub fn interactive(args: InteractiveArgs, _verbosity: Verbosity) -> Result<()> {
     }
 
     print_info("Starting interactive session (type 'help' for commands)");
+    // Show paused file/line if available
+    if engine.is_paused() {
+        if let Some(loc) = engine.current_source_location() {
+            let file = loc.file.display();
+            let line = loc.line;
+            let col = loc.column.map(|c| format!(":{}", c)).unwrap_or_default();
+            print_info(format!("Paused at: {}:{}{}", file, line, col));
+        }
+    }
     let mut ui = DebuggerUI::new(engine)?;
     ui.queue_execution(args.function.clone(), parsed_args);
     ui.run()

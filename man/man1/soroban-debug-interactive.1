@@ -7,6 +7,8 @@ interactive \- Start an interactive debugging session
 \fBinteractive\fR <\fB\-c\fR|\fB\-\-contract\fR> [\fB\-\-network\-snapshot\fR] <\fB\-f\fR|\fB\-\-function\fR> [\fB\-a\fR|\fB\-\-args\fR] [\fB\-s\fR|\fB\-\-storage\fR] [\fB\-\-import\-storage\fR] [\fB\-b\fR|\fB\-\-breakpoint\fR] [\fB\-\-mock\fR] [\fB\-\-timeout\fR] [\fB\-\-instruction\-debug\fR] [\fB\-\-step\-instructions\fR] [\fB\-\-step\-mode\fR] [\fB\-\-expected\-hash\fR] [\fB\-h\fR|\fB\-\-help\fR] 
 .SH DESCRIPTION
 Start an interactive debugging session
+
+When execution is paused and source mapping information is available, the debugger will display the exact source file and line number where execution is paused. This is shown in both the CLI and TUI interfaces.
 .SH OPTIONS
 .TP
 \fB\-c\fR, \fB\-\-contract\fR \fI<CONTRACT>\fR
