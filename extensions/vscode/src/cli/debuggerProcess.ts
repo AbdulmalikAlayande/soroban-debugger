@@ -175,6 +175,14 @@ export class DebuggerProcess {
       : (Number.isFinite(envConnectTimeout) ? envConnectTimeout : 10_000);
   }
 
+  public cancel(): void {
+    if (!this.childProcess || this.childProcess.killed) return;
+    this.sendRequest({ type: 'Cancel' }).catch(() => {
+      // Ignore network errors since the server dropping the connection
+      // is the expected behavior for an interrupted execution
+    });
+  }
+
   async start(): Promise<void> {
     if (this.childProcess || this.socket) {
       return;

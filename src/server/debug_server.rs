@@ -93,23 +93,66 @@ impl DebugServer {
 
     async fn handle_single_connection<S>(&mut self, stream: S) -> Result<()>
     where
-        S: tokio::io::AsyncRead + AsyncWrite + Unpin,
+        S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
     {
         let mut authenticated = self.token.is_none();
         let mut handshake_done = false;
         let (reader, mut writer) = tokio::io::split(stream);
-        let mut reader = BufReader::new(reader);
-        let mut line = String::new();
+        let mut reader = tokio::io::BufReader::new(reader);
+
+        let (tx_in, mut rx_in) = tokio::sync::mpsc::unbounded_channel::<String>();
+        let (tx_out, mut rx_out) = tokio::sync::mpsc::unbounded_channel::<DebugMessage>();
+
+        tokio::spawn(async move {
+            let mut writer = writer;
+            while let Some(msg) = rx_out.recv().await {
+                if crate::server::protocol::send_response::<tokio::io::WriteHalf<S>>(&mut writer, msg).await.is_err() {
+                    break;
+                }
+            }
+        });
+
+        let tx_out_reader = tx_out.clone();
+        let is_executing = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let is_executing_reader = Arc::clone(&is_executing);
+
+        tokio::spawn(async move {
+            let mut line = String::new();
+            loop {
+                line.clear();
+                let n = reader.read_line(&mut line).await.unwrap_or(0);
+                if n == 0 { break; }
+
+                if let Ok(msg) = DebugMessage::parse(line.trim_end()) {
+                    if matches!(msg.request, Some(DebugRequest::Cancel)) {
+                        let response = DebugMessage::response(msg.id, DebugResponse::CancelAck);
+                        let _ = tx_out_reader.send(response);
+                        if is_executing_reader.load(std::sync::atomic::Ordering::SeqCst) {
+                            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+                            eprintln!("Execution cancelled via request. Aborting with exit code 125.");
+                            std::process::exit(125);
+                        }
+                        continue;
+                    }
+                }
+
+                if tx_in.send(line.clone()).is_err() {
+                    break;
+                }
+            }
+        });
+
+        // Helper closure to abstract away tx_out
+        let mut send_msg = |msg: DebugMessage| -> Result<()> {
+            tx_out.send(msg).map_err(|_| miette::miette!("Connection closed"))
+        };
 
         loop {
-            line.clear();
-            let n = reader
-                .read_line(&mut line)
-                .await
-                .map_err(|e| miette::miette!("Failed to read from stream: {}", e))?;
-            if n == 0 {
-                break;
-            }
+            let line = match rx_in.recv().await {
+                Some(l) => l,
+                None => break,
+            };
+            is_executing.store(false, std::sync::atomic::Ordering::SeqCst);
 
             let message = match DebugMessage::parse(line.trim_end()) {
                 Ok(msg) => msg,
@@ -122,7 +165,7 @@ impl DebugServer {
                             message: format!("Malformed request: {}", e),
                         },
                     );
-                    let _ = send_response(&mut writer, response).await;
+                    let _ = send_msg(response);
                     continue;
                 }
             };
@@ -138,7 +181,7 @@ impl DebugServer {
                         message: "Unknown request type. Try upgrading the server.".to_string(),
                     },
                 );
-                send_response(&mut writer, response).await?;
+                send_msg(response)?;
                 continue;
             }
 
@@ -146,7 +189,7 @@ impl DebugServer {
 
             if matches!(request, DebugRequest::Ping) {
                 let response = DebugMessage::response(message.id, DebugResponse::Pong);
-                send_response(&mut writer, response).await?;
+                send_msg(response)?;
                 continue;
             }
 
@@ -173,7 +216,7 @@ impl DebugServer {
                                 selected_version,
                             },
                         );
-                        send_response(&mut writer, response).await?;
+                        send_msg(response)?;
                         continue;
                     }
                     Err(e) => {
@@ -190,7 +233,7 @@ impl DebugServer {
                                 protocol_max: PROTOCOL_MAX_VERSION,
                             },
                         );
-                        send_response(&mut writer, response).await?;
+                        send_msg(response)?;
                         return Ok(());
                     }
                 }
@@ -203,7 +246,7 @@ impl DebugServer {
                         message: "Protocol handshake required: send a Handshake request before other debug requests.".to_string(),
                     },
                 );
-                send_response(&mut writer, response).await?;
+                send_msg(response)?;
                 continue;
             }
 
@@ -220,7 +263,7 @@ impl DebugServer {
                         },
                     };
                     let response = DebugMessage::response(message.id, response);
-                    send_response(&mut writer, response).await?;
+                    send_msg(response)?;
                     if !success {
                         return Ok(());
                     }
@@ -233,7 +276,7 @@ impl DebugServer {
                         message: "Authentication required".to_string(),
                     },
                 );
-                send_response(&mut writer, response).await?;
+                send_msg(response)?;
                 continue;
             }
 
@@ -295,10 +338,20 @@ impl DebugServer {
                                             source_location: None,
                                         }
                                     } else {
-                                        execute_without_breakpoints(engine, &function, args)
+                                        { 
+                                        is_executing.store(true, std::sync::atomic::Ordering::SeqCst);
+                                        let r = execute_without_breakpoints(engine, &function, args);
+                                        is_executing.store(false, std::sync::atomic::Ordering::SeqCst);
+                                        r
+                                    }
                                     }
                                 }
-                                Ok(None) => execute_without_breakpoints(engine, &function, args),
+                                Ok(None) => { 
+                                        is_executing.store(true, std::sync::atomic::Ordering::SeqCst);
+                                        let r = execute_without_breakpoints(engine, &function, args);
+                                        is_executing.store(false, std::sync::atomic::Ordering::SeqCst);
+                                        r
+                                    },
                                 Err(e) => DebugResponse::Error {
                                     message: e.to_string(),
                                 },
@@ -308,7 +361,12 @@ impl DebugServer {
                             },
                         }
                     }
-                    Some(engine) => execute_without_breakpoints(engine, &function, args),
+                    Some(engine) => { 
+                                        is_executing.store(true, std::sync::atomic::Ordering::SeqCst);
+                                        let r = execute_without_breakpoints(engine, &function, args);
+                                        is_executing.store(false, std::sync::atomic::Ordering::SeqCst);
+                                        r
+                                    },
                     None => DebugResponse::Error {
                         message: "No contract loaded".to_string(),
                     },
@@ -384,10 +442,15 @@ impl DebugServer {
                                     )
                                 })
                                 .unwrap_or((None, 0));
-                            match engine.execute_without_breakpoints(
-                                &pending.function,
-                                pending.args.as_deref(),
-                            ) {
+                            match {
+                                is_executing.store(true, std::sync::atomic::Ordering::SeqCst);
+                                let r = engine.execute_without_breakpoints(
+                                    &pending.function,
+                                    pending.args.as_deref(),
+                                );
+                                is_executing.store(false, std::sync::atomic::Ordering::SeqCst);
+                                r
+                            } {
                                 Ok(_) => DebugResponse::StepResult {
                                     paused: false,
                                     current_function,
@@ -451,10 +514,15 @@ impl DebugServer {
                 DebugRequest::Continue => match self.engine.as_mut() {
                     Some(engine) => {
                         if let Some(pending) = self.pending_execution.take() {
-                            match engine.execute_without_breakpoints(
-                                &pending.function,
-                                pending.args.as_deref(),
-                            ) {
+                            match {
+                                is_executing.store(true, std::sync::atomic::Ordering::SeqCst);
+                                let r = engine.execute_without_breakpoints(
+                                    &pending.function,
+                                    pending.args.as_deref(),
+                                );
+                                is_executing.store(false, std::sync::atomic::Ordering::SeqCst);
+                                r
+                            } {
                                 Ok(output) => DebugResponse::ContinueResult {
                                     completed: true,
                                     output: Some(output),
@@ -599,7 +667,7 @@ impl DebugServer {
                                             message: e.to_string(),
                                         },
                                     );
-                                    send_response(&mut writer, response).await?;
+                                    send_msg(response)?;
                                     continue;
                                 }
                             },
@@ -616,7 +684,7 @@ impl DebugServer {
                                                 message: e.to_string(),
                                             },
                                         );
-                                        send_response(&mut writer, response).await?;
+                                        send_msg(response)?;
                                         continue;
                                     }
                                 }
@@ -770,10 +838,14 @@ impl DebugServer {
                 },
                 DebugRequest::Ping => DebugResponse::Pong,
                 DebugRequest::Disconnect => DebugResponse::Disconnected,
+                DebugRequest::Cancel => DebugResponse::CancelAck,
+                DebugRequest::Unknown => DebugResponse::Error {
+                    message: "Unknown request type. Try upgrading the server.".to_string(),
+                },
             };
 
             let response = DebugMessage::response(message.id, response);
-            send_response(&mut writer, response).await?;
+            send_msg(response)?;
 
             if is_disconnect {
                 break;
@@ -782,23 +854,6 @@ impl DebugServer {
 
         Ok(())
     }
-}
-
-async fn send_response<S>(stream: &mut S, response: DebugMessage) -> Result<()>
-where
-    S: AsyncWrite + Unpin,
-{
-    let json = serde_json::to_vec(&response)
-        .map_err(|e| miette::miette!("Failed to serialize response: {}", e))?;
-    stream
-        .write_all(&json)
-        .await
-        .map_err(|e| miette::miette!("Failed to write response: {}", e))?;
-    stream
-        .write_all(b"\n")
-        .await
-        .map_err(|e| miette::miette!("Failed to write response newline: {}", e))?;
-    Ok(())
 }
 
 fn execute_without_breakpoints(

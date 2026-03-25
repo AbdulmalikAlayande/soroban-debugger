@@ -465,7 +465,7 @@ export class SorobanDebugSession extends DebugSession {
   }
 
   // VS Code will send a DAP "cancel" request with the requestId (seq) of the request to cancel.
-  // We only support canceling long-running evaluate() calls at the moment.
+  // We forward this to the backend as a protocol-level Cancel to interrupt any long-running execution.
   protected cancelRequest(response: any, args: any): void {
     const requestId = args?.requestId as number | undefined;
     if (typeof requestId === 'number') {
@@ -473,6 +473,8 @@ export class SorobanDebugSession extends DebugSession {
       controller?.abort();
       this.requestAbortControllers.delete(requestId);
     }
+    
+    this.debuggerProcess?.cancel();
 
     this.sendResponse(response);
   }
