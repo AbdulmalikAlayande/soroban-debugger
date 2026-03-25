@@ -56,6 +56,12 @@ export class SorobanDebugSession extends DebugSession {
     args: LaunchRequestArgs
   ): Promise<void> {
     try {
+      const preflight = await validateLaunchConfig(args);
+      if (!preflight.ok) {
+        const issue = preflight.issues[0];
+        throw new Error(`${issue.message} Expected: ${issue.expected}`);
+      }
+
       this.debuggerProcess = new DebuggerProcess({
         contractPath: args.contractPath,
         snapshotPath: args.snapshotPath,

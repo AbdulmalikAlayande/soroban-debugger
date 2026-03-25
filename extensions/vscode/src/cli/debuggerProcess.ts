@@ -8,13 +8,43 @@ export interface DebuggerProcessConfig {
   contractPath: string;
   snapshotPath?: string;
   entrypoint?: string;
-  args?: string[];
+  args?: unknown[];
   trace?: boolean;
   binaryPath?: string;
   port?: number;
   token?: string;
   requestTimeoutMs?: number;
   connectTimeoutMs?: number;
+}
+
+export type LaunchPreflightField =
+  | 'binaryPath'
+  | 'contractPath'
+  | 'snapshotPath'
+  | 'entrypoint'
+  | 'args'
+  | 'port'
+  | 'token';
+
+export type LaunchPreflightQuickFix =
+  | 'pickBinary'
+  | 'pickContract'
+  | 'pickSnapshot'
+  | 'openLaunchConfig'
+  | 'generateLaunchConfig'
+  | 'openSettings';
+
+export interface LaunchPreflightIssue {
+  field: LaunchPreflightField;
+  message: string;
+  expected: string;
+  quickFixes: LaunchPreflightQuickFix[];
+}
+
+export interface LaunchPreflightResult {
+  ok: boolean;
+  issues: LaunchPreflightIssue[];
+  resolvedBinaryPath: string;
 }
 
 export interface DebuggerExecutionResult {
@@ -187,19 +217,18 @@ export class DebuggerProcess {
       return;
     }
 
-    try {
-      const binaryPath = this.resolveBinaryPath();
-      const port = this.config.port ?? await this.findAvailablePort();
-      this.port = port;
+    const binaryPath = resolveDebuggerBinaryPath(this.config);
+    const port = this.config.port ?? await this.findAvailablePort();
+    this.port = port;
 
-      const child = spawn(binaryPath, this.buildArgs(port), {
-        stdio: ['ignore', 'pipe', 'pipe'],
-        env: {
-          ...process.env,
-          ...(this.config.trace ? { RUST_LOG: 'debug' } : {})
-        }
-      });
-      this.process = child;
+    const child = spawn(binaryPath, this.buildArgs(port), {
+      stdio: ['ignore', 'pipe', 'pipe'],
+      env: {
+        ...process.env,
+        ...(this.config.trace ? { RUST_LOG: 'debug' } : {})
+      }
+    });
+    this.process = child;
 
       child.once('exit', () => {
         this.rejectPendingRequests(new Error('Debugger server exited'));
@@ -371,7 +400,7 @@ export class DebuggerProcess {
   }
 
   async getContractFunctions(): Promise<Set<string>> {
-    const binaryPath = this.resolveBinaryPath();
+    const binaryPath = resolveDebuggerBinaryPath(this.config);
 
     const output = await new Promise<string>((resolve, reject) => {
       const child = execFile(
@@ -513,24 +542,6 @@ export class DebuggerProcess {
 
   isRunning(): boolean {
     return this.process !== null && this.socket !== null && !this.socket.destroyed;
-  }
-
-  private resolveBinaryPath(): string {
-    if (this.config.binaryPath) {
-      return this.config.binaryPath;
-    }
-
-    if (process.env.SOROBAN_DEBUG_BIN) {
-      return process.env.SOROBAN_DEBUG_BIN;
-    }
-
-    const repoRoot = path.resolve(__dirname, '..', '..', '..', '..');
-    const candidates = [
-      path.join(repoRoot, 'target', 'debug', process.platform === 'win32' ? 'soroban-debug.exe' : 'soroban-debug'),
-      process.platform === 'win32' ? 'soroban-debug.exe' : 'soroban-debug'
-    ];
-
-    return candidates.find(candidate => fs.existsSync(candidate)) || candidates[candidates.length - 1];
   }
 
   private async findAvailablePort(): Promise<number> {
@@ -743,4 +754,180 @@ export class DebuggerProcess {
       throw new Error(`Unexpected debugger response: expected ${type}, got ${response.type}`);
     }
   }
+}
+
+function pushFileIssue(
+  issues: LaunchPreflightIssue[],
+  field: 'binaryPath' | 'contractPath' | 'snapshotPath',
+  filePath: string | undefined,
+  expected: string,
+  quickFixes: LaunchPreflightQuickFix[]
+): void {
+  if (!filePath || filePath.trim().length === 0) {
+    issues.push({
+      field,
+      message: `Launch config field '${field}' must point to ${expected}.`,
+      expected,
+      quickFixes
+    });
+    return;
+  }
+
+  if (field === 'binaryPath' && isCommandOnPath(filePath)) {
+    return;
+  }
+
+  try {
+    const stat = fs.statSync(filePath);
+    if (!stat.isFile()) {
+      issues.push({
+        field,
+        message: `Launch config field '${field}' points to '${filePath}', but that path is not a file.`,
+        expected,
+        quickFixes
+      });
+      return;
+    }
+
+    fs.accessSync(filePath, fs.constants.R_OK);
+  } catch {
+    issues.push({
+      field,
+      message: `Launch config field '${field}' points to '${filePath}', but the file does not exist or is not readable.`,
+      expected,
+      quickFixes
+    });
+  }
+}
+
+function isCommandOnPath(command: string): boolean {
+  if (path.isAbsolute(command) || command.includes(path.sep) || command.includes('/')) {
+    return false;
+  }
+
+  const pathValue = process.env.PATH;
+  if (!pathValue) {
+    return false;
+  }
+
+  const extensions = process.platform === 'win32'
+    ? (process.env.PATHEXT || '.EXE;.CMD;.BAT;.COM')
+        .split(';')
+        .filter((ext) => ext.length > 0)
+    : [''];
+
+  for (const directory of pathValue.split(path.delimiter)) {
+    for (const extension of extensions) {
+      const candidate = path.join(directory, command.endsWith(extension) ? command : `${command}${extension}`);
+      if (fs.existsSync(candidate)) {
+        return true;
+      }
+    }
+  }
+
+  return false;
+}
+
+function validateArgs(args: unknown): LaunchPreflightIssue | undefined {
+  if (!Array.isArray(args)) {
+    return {
+      field: 'args',
+      message: `Launch config field 'args' must be an array; received ${describeValue(args)}.`,
+      expected: 'A JSON array such as [] or ["alice", 10].',
+      quickFixes: ['openLaunchConfig', 'generateLaunchConfig']
+    };
+  }
+
+  const seen = new Set<unknown>();
+  const invalidPath = findNonSerializableValue(args, '$', seen);
+  if (invalidPath) {
+    return {
+      field: 'args',
+      message: `Launch config field 'args' contains a non-JSON-serializable value at ${invalidPath}.`,
+      expected: 'Only JSON-serializable values: strings, numbers, booleans, null, arrays, and objects.',
+      quickFixes: ['openLaunchConfig', 'generateLaunchConfig']
+    };
+  }
+
+  return undefined;
+}
+
+function findNonSerializableValue(value: unknown, pathLabel: string, seen: Set<unknown>): string | undefined {
+  if (
+    value === null ||
+    typeof value === 'string' ||
+    typeof value === 'boolean'
+  ) {
+    return undefined;
+  }
+
+  if (typeof value === 'number') {
+    return Number.isFinite(value) ? undefined : pathLabel;
+  }
+
+  if (
+    typeof value === 'undefined' ||
+    typeof value === 'function' ||
+    typeof value === 'symbol' ||
+    typeof value === 'bigint'
+  ) {
+    return pathLabel;
+  }
+
+  if (Array.isArray(value)) {
+    if (seen.has(value)) {
+      return pathLabel;
+    }
+    seen.add(value);
+    for (let index = 0; index < value.length; index += 1) {
+      const found = findNonSerializableValue(value[index], `${pathLabel}[${index}]`, seen);
+      if (found) {
+        return found;
+      }
+    }
+    seen.delete(value);
+    return undefined;
+  }
+
+  if (typeof value === 'object') {
+    const record = value as Record<string, unknown>;
+    if (seen.has(record)) {
+      return pathLabel;
+    }
+    seen.add(record);
+    for (const [key, item] of Object.entries(record)) {
+      const found = findNonSerializableValue(item, `${pathLabel}.${key}`, seen);
+      if (found) {
+        return found;
+      }
+    }
+    seen.delete(record);
+    return undefined;
+  }
+
+  return pathLabel;
+}
+
+function describeValue(value: unknown): string {
+  if (Array.isArray(value)) {
+    return 'an array';
+  }
+  if (value === null) {
+    return 'null';
+  }
+  return typeof value;
+}
+
+async function isPortAvailable(port: number): Promise<boolean> {
+  return await new Promise<boolean>((resolve) => {
+    const server = net.createServer();
+    server.once('error', () => {
+      server.close();
+      resolve(false);
+    });
+    server.once('listening', () => {
+      server.close(() => resolve(true));
+    });
+    server.listen(port, '127.0.0.1');
+  });
 }
