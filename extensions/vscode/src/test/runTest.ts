@@ -267,23 +267,28 @@ async function runDapHappyPathE2E(
     const stepIn = await client.request('stepIn', { threadId: 1 }, 30_000);
     assert.equal(stepIn.success, true);
     const afterStepIn = await client.waitForAnyEvent(['stopped', 'exited'], () => true, 30_000);
+    let executionExited = afterStepIn.event === 'exited';
 
-    if (afterStepIn.event === 'stopped') {
+    if (!executionExited) {
       const next = await client.request('next', { threadId: 1 }, 30_000);
       assert.equal(next.success, true);
       const afterNext = await client.waitForAnyEvent(['stopped', 'exited'], () => true, 30_000);
 
-      if (afterNext.event === 'stopped') {
+      executionExited = afterNext.event === 'exited';
+
+      if (!executionExited) {
         const stepOut = await client.request('stepOut', { threadId: 1 }, 30_000);
         assert.equal(stepOut.success, true);
-        await client.waitForAnyEvent(['stopped', 'exited'], () => true, 30_000);
+        const afterStepOut = await client.waitForAnyEvent(['stopped', 'exited'], () => true, 30_000);
+        executionExited = afterStepOut.event === 'exited';
       }
     }
 
-    // Finish execution.
-    const cont2 = await client.request('continue', { threadId: 1 }, 30_000);
-    assert.equal(cont2.success, true);
-    await client.waitForEvent('exited', () => true, 30_000);
+    if (!executionExited) {
+      const cont2 = await client.request('continue', { threadId: 1 }, 30_000);
+      assert.equal(cont2.success, true);
+      await client.waitForEvent('exited', () => true, 30_000);
+    }
 
     const disconnect = await client.request('disconnect', { restart: false });
     assert.equal(disconnect.success, true);
