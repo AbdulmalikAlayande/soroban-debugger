@@ -6,6 +6,8 @@ When using the interactive CLI or TUI debugger, if source mapping information is
 
 The `inspect` command provides a way to analyze Soroban contract WASM files without executing them. It displays contract metadata, exported functions, and module statistics.
 
+It also exposes a source-map diagnostics mode for DWARF triage, so you can inspect mapping coverage and fallback behavior without starting a debug session.
+
 ## Basic Usage
 
 ```bash
@@ -89,6 +91,28 @@ Get the complete report in JSON format:
 soroban-debug inspect --contract mycontract.wasm --format json
 ```
 
+### 5. Source Map Diagnostics
+
+Inspect DWARF-backed source mappings directly from the CLI:
+
+```bash
+soroban-debug inspect --contract mycontract.wasm --source-map-diagnostics
+```
+
+This mode prints:
+
+- Resolved mapping count
+- A preview of resolved WASM-offset to source-location mappings
+- Missing and present DWARF sections
+- Parser diagnostics and warnings
+- The fallback mode the debugger will use when mappings are incomplete or unavailable
+
+For CI and editor integrations, use JSON output:
+
+```bash
+soroban-debug inspect --contract mycontract.wasm --source-map-diagnostics --format json
+```
+
 ## Command Options
 
 | Option                        | Description                                | Default  |
@@ -97,6 +121,8 @@ soroban-debug inspect --contract mycontract.wasm --format json
 | `--functions`                 | Show only exported functions               | Off      |
 | `--metadata`                  | Show only contract metadata                | Off      |
 | `--format <FORMAT>`           | Output format: `pretty` or `json`          | `pretty` |
+| `--source-map-diagnostics`    | Print DWARF/source-map diagnostics         | Off      |
+| `--source-map-limit <N>`      | Limit mapping preview rows in diagnostics  | `20`     |
 | `--expected-hash <HASH>`      | Verify SHA-256 hash matches                | Optional |
 | `--dependency-graph <FORMAT>` | Show dependency graph (`dot` or `mermaid`) | Optional |
 

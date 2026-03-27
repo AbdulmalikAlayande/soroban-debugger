@@ -2,6 +2,10 @@
 use predicates::prelude::*;
 use tempfile::TempDir;
 
+fn fixture_wasm() -> &'static str {
+    "tests/fixtures/wasm/counter.wasm"
+}
+
 #[test]
 fn test_inspect_requires_contract_arg() {
     let mut cmd = assert_cmd::Command::cargo_bin("soroban-debug").expect("Failed to find binary");
@@ -89,4 +93,40 @@ fn test_inspect_functions_with_json_format() {
     if !output.status.success() {
         assert_eq!(output.status.code(), Some(1));
     }
+}
+
+#[test]
+fn test_inspect_source_map_diagnostics_pretty_output() {
+    let mut cmd = assert_cmd::Command::cargo_bin("soroban-debug").expect("Failed to find binary");
+    cmd.args([
+        "inspect",
+        "--contract",
+        fixture_wasm(),
+        "--source-map-diagnostics",
+    ])
+    .assert()
+    .success()
+    .stdout(predicate::str::contains("Source Map Diagnostics"))
+    .stdout(predicate::str::contains("Fallback mode:"))
+    .stdout(predicate::str::contains("DWARF sections:"));
+}
+
+#[test]
+fn test_inspect_source_map_diagnostics_json_output() {
+    let mut cmd = assert_cmd::Command::cargo_bin("soroban-debug").expect("Failed to find binary");
+    cmd.args([
+        "inspect",
+        "--contract",
+        fixture_wasm(),
+        "--source-map-diagnostics",
+        "--format",
+        "json",
+        "--source-map-limit",
+        "3",
+    ])
+    .assert()
+    .success()
+    .stdout(predicate::str::contains("\"source_map\""))
+    .stdout(predicate::str::contains("\"sections\""))
+    .stdout(predicate::str::contains("\"fallback_mode\""));
 }

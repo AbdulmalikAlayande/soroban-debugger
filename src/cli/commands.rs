@@ -2,9 +2,9 @@ use crate::analyzer::symbolic::SymbolicConfig;
 use crate::analyzer::upgrade::{CompatibilityReport, ExecutionDiff, UpgradeAnalyzer};
 use crate::analyzer::{security::SecurityAnalyzer, symbolic::SymbolicAnalyzer};
 use crate::cli::args::{
-    AnalyzeArgs, CompareArgs, InspectArgs, InteractiveArgs, OptimizeArgs, ProfileArgs, RemoteArgs,
-    ReplArgs, ReplayArgs, RunArgs, ScenarioArgs, ServerArgs, SymbolicArgs, SymbolicProfile,
-    TuiArgs, UpgradeCheckArgs, Verbosity,
+    AnalyzeArgs, CompareArgs, InspectArgs, InteractiveArgs, OptimizeArgs, OutputFormat,
+    ProfileArgs, RemoteArgs, ReplArgs, ReplayArgs, RunArgs, ScenarioArgs, ServerArgs,
+    SymbolicArgs, SymbolicProfile, TuiArgs, UpgradeCheckArgs, Verbosity,
 };
 use crate::debugger::engine::DebuggerEngine;
 use crate::debugger::instruction_pointer::StepMode;
@@ -76,6 +76,12 @@ struct AnalyzeCommandOutput {
     findings: Vec<crate::analyzer::security::SecurityFinding>,
     dynamic_analysis: Option<DynamicAnalysisMetadata>,
     warnings: Vec<String>,
+}
+
+#[derive(serde::Serialize)]
+struct SourceMapDiagnosticsCommandOutput {
+    contract: String,
+    source_map: crate::debugger::source_map::SourceMapInspectionReport,
 }
 
 fn render_symbolic_report(report: &crate::analyzer::symbolic::SymbolicReport) -> String {
@@ -1901,8 +1907,24 @@ pub fn tui(args: TuiArgs, _verbosity: Verbosity) -> Result<()> {
 
 /// Inspect a WASM contract
 pub fn inspect(args: InspectArgs, _verbosity: Verbosity) -> Result<()> {
-    let bytes = fs::read(&args.contract)
-        .map_err(|e| miette::miette!("Failed to read contract {:?}: {}", args.contract, e))?;
+    let wasm_file = crate::utils::wasm::load_wasm(&args.contract)
+        .with_context(|| format!("Failed to read WASM file: {:?}", args.contract))?;
+    if let Some(expected) = &args.expected_hash {
+        if !wasm_file.sha256_hash.eq_ignore_ascii_case(expected) {
+            return Err(DebuggerError::ChecksumMismatch {
+                expected: expected.clone(),
+                actual: wasm_file.sha256_hash.clone(),
+            }
+            .into());
+        }
+    }
+
+    let bytes = wasm_file.bytes;
+
+    if args.source_map_diagnostics {
+        return inspect_source_map_diagnostics(&args, &bytes);
+    }
+
     let info = crate::utils::wasm::get_module_info(&bytes)?;
     println!("Contract: {:?}", args.contract);
     println!("Size: {} bytes", info.total_size);
@@ -1922,6 +1944,65 @@ pub fn inspect(args: InspectArgs, _verbosity: Verbosity) -> Result<()> {
             println!("  {}({}) -> {}", sig.name, params.join(", "), ret);
         }
     }
+    Ok(())
+}
+
+fn inspect_source_map_diagnostics(args: &InspectArgs, wasm_bytes: &[u8]) -> Result<()> {
+    let report =
+        crate::debugger::source_map::SourceMap::inspect_wasm(wasm_bytes, args.source_map_limit)?;
+
+    match args.format {
+        OutputFormat::Json => {
+            let output = SourceMapDiagnosticsCommandOutput {
+                contract: args.contract.display().to_string(),
+                source_map: report,
+            };
+            println!("{}", serde_json::to_string_pretty(&output)?);
+        }
+        OutputFormat::Pretty => {
+            println!("Source Map Diagnostics");
+            println!("Contract: {}", args.contract.display());
+            println!("Resolved mappings: {}", report.mappings_count);
+            println!("Fallback mode: {}", report.fallback_mode);
+            println!("Fallback behavior: {}", report.fallback_message);
+
+            println!("\nDWARF sections:");
+            for section in &report.sections {
+                let status = if section.present { "present" } else { "missing" };
+                println!("  {}: {} ({} bytes)", section.name, status, section.size_bytes);
+            }
+
+            if report.preview.is_empty() {
+                println!("\nResolved mappings preview: none");
+            } else {
+                println!("\nResolved mappings preview:");
+                for mapping in &report.preview {
+                    let column = mapping
+                        .location
+                        .column
+                        .map(|column| format!(":{}", column))
+                        .unwrap_or_default();
+                    println!(
+                        "  0x{offset:08x} -> {file}:{line}{column}",
+                        offset = mapping.offset,
+                        file = mapping.location.file.display(),
+                        line = mapping.location.line,
+                        column = column
+                    );
+                }
+            }
+
+            if report.diagnostics.is_empty() {
+                println!("\nDiagnostics: none");
+            } else {
+                println!("\nDiagnostics:");
+                for diagnostic in &report.diagnostics {
+                    println!("  - {}", diagnostic.message);
+                }
+            }
+        }
+    }
+
     Ok(())
 }
 

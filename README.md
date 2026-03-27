@@ -152,6 +152,17 @@ Options:
   --tls-cert <FILE>     Path to TLS certificate for secure connections
   --tls-key <FILE>      Path to TLS private key
 
+### Remote Troubleshooting Matrix
+
+| Symptom | Likely cause | What to try |
+| --- | --- | --- |
+| Request timed out | Slow host or timeout too low for inspect/storage traffic | Increase `soroban-debug remote --timeout-ms`, `--inspect-timeout-ms`, or `--storage-timeout-ms` depending on the failing request. |
+| Incompatible debugger protocol | Client and server builds are out of sync | Rebuild or reinstall the CLI/server from the same revision or release line. |
+| Authentication failed | Token missing or mismatched | Make sure the server `--token` and client `--token` values match exactly. |
+| Loopback/connect failure | `localhost` blocked, wrong port, firewall, or container networking issue | Verify the server is listening, try `127.0.0.1`, and check your environment's loopback/network policy. |
+
+See [docs/remote-troubleshooting.md](./docs/remote-troubleshooting.md) for the full CLI and VS Code troubleshooting guide, including timeout tuning and adapter-specific advice.
+
 
 ### Automatic Test Generation
 
@@ -262,11 +273,30 @@ the user-facing name for the value printed in the report).
 Run a multi-step test scenario defined in a TOML file:
 
 ```bash
-soroban-debug scenario --scenario my_scenario.toml --contract my_contract.wasm
+soroban-debug scenario --scenario my_scenario.toml --contract my_contract.wasm --timeout 30
 ```
 
 Each step can specify a function to call, its arguments, and assertions on the return value,
 contract storage, emitted events, and CPU/memory budget.
+
+Scenario timeouts inherit in this order: step `timeout_secs`, then top-level `[defaults].timeout_secs`,
+then the CLI `--timeout` value, and finally the built-in 30 second default. Use `0` to disable the
+timeout for a default or a specific step.
+
+```toml
+[defaults]
+timeout_secs = 10
+
+[[steps]]
+name = "Cheap setup"
+function = "initialize"
+expected_return = "()"
+
+[[steps]]
+name = "Expensive replay"
+function = "replay_heavy_case"
+timeout_secs = 0
+```
 
 #### Capturing Step Outputs into Variables
 
@@ -306,6 +336,7 @@ currently available.
 | `name` | string | Optional human-readable label for the step |
 | `function` | string | Contract function to call |
 | `args` | string (JSON) | Function arguments as a JSON array. Supports `{{var}}` interpolation. |
+| `timeout_secs` | integer | Override the inherited execution timeout for this step. `0` disables timeout enforcement. |
 | `capture` | string | Variable name to store the return value in for use by later steps |
 | `expected_return` | string | Assert the return value equals this. Supports `{{var}}` interpolation. |
 | `expected_error` | string | Assert the step fails with an error message containing this substring |
@@ -448,8 +479,13 @@ soroban-debug inspect [OPTIONS]
 
 Options:
   -c, --contract <FILE>     Path to the contract WASM file
+      --source-map-diagnostics
+                            Print resolved mappings, missing DWARF sections, and fallback behavior
       --dependency-graph     Export cross-contract dependency graph (DOT + Mermaid)
 ```
+
+Use `soroban-debug inspect --contract my_contract.wasm --source-map-diagnostics --format json`
+when you want a non-interactive DWARF triage report for CI or editor tooling.
 
 For full examples, see [docs/dependency-graph.md](https://github.com/Timi16/soroban-debugger/blob/main/docs/dependency-graph.md).
 

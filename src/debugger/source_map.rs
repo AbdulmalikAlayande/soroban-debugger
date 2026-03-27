@@ -5,6 +5,18 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use wasmparser::{Parser, Payload};
 
+const DWARF_SECTION_NAMES: &[&str] = &[
+    ".debug_info",
+    ".debug_abbrev",
+    ".debug_line",
+    ".debug_str",
+    ".debug_line_str",
+    ".debug_ranges",
+    ".debug_rnglists",
+    ".debug_addr",
+    ".debug_str_offsets",
+];
+
 /// FNV-1a 64-bit hash of `data`.  Used as a fast fingerprint to detect whether
 /// the WASM bytes have changed since the last parse.  No external dependency needed.
 fn fnv1a_hash(data: &[u8]) -> u64 {
@@ -30,6 +42,29 @@ pub struct SourceLocation {
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct SourceMapDiagnostic {
     pub message: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct SourceMapSectionStatus {
+    pub name: String,
+    pub present: bool,
+    pub size_bytes: usize,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct SourceMapMappingPreview {
+    pub offset: usize,
+    pub location: SourceLocation,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct SourceMapInspectionReport {
+    pub mappings_count: usize,
+    pub preview: Vec<SourceMapMappingPreview>,
+    pub sections: Vec<SourceMapSectionStatus>,
+    pub diagnostics: Vec<SourceMapDiagnostic>,
+    pub fallback_mode: String,
+    pub fallback_message: String,
 }
 
 /// Manages mapping from WASM offsets to source code locations
@@ -213,6 +248,89 @@ impl SourceMap {
         self.last_wasm_hash = Some(hash);
         self.parse_count += 1;
         Ok(())
+    }
+
+    pub fn inspect_wasm(wasm_bytes: &[u8], preview_limit: usize) -> Result<SourceMapInspectionReport> {
+        let section_sizes = dwarf_section_sizes(wasm_bytes)?;
+        let sections = DWARF_SECTION_NAMES
+            .iter()
+            .map(|name| SourceMapSectionStatus {
+                name: (*name).to_string(),
+                present: section_sizes.contains_key(*name),
+                size_bytes: section_sizes.get(*name).copied().unwrap_or(0),
+            })
+            .collect::<Vec<_>>();
+
+        let mut source_map = SourceMap::new();
+        let load_result = source_map.load(wasm_bytes);
+        let diagnostics = source_map.diagnostics.clone();
+        let preview = source_map
+            .mappings()
+            .take(preview_limit)
+            .map(|(offset, location)| SourceMapMappingPreview {
+                offset,
+                location: location.clone(),
+            })
+            .collect::<Vec<_>>();
+        let mappings_count = source_map.len();
+
+        let missing_sections = sections
+            .iter()
+            .filter(|section| !section.present)
+            .map(|section| section.name.as_str())
+            .collect::<Vec<_>>();
+
+        let (fallback_mode, fallback_message) = if mappings_count > 0 {
+            if diagnostics.is_empty() {
+                (
+                    "source".to_string(),
+                    "DWARF line mappings resolved successfully.".to_string(),
+                )
+            } else {
+                (
+                    "partial-source".to_string(),
+                    "DWARF mappings were resolved, but some debug metadata was missing or malformed; the debugger may fall back to less precise location data for unmapped code.".to_string(),
+                )
+            }
+        } else if missing_sections.is_empty() {
+            (
+                "wasm-only".to_string(),
+                "No executable source mappings were produced; the debugger will fall back to WASM-only behavior.".to_string(),
+            )
+        } else {
+            (
+                "wasm-only".to_string(),
+                format!(
+                    "Missing DWARF sections ({}) prevent source-level mapping; the debugger will fall back to WASM-only behavior.",
+                    missing_sections.join(", ")
+                ),
+            )
+        };
+
+        match load_result {
+            Ok(()) => Ok(SourceMapInspectionReport {
+                mappings_count,
+                preview,
+                sections,
+                diagnostics,
+                fallback_mode,
+                fallback_message,
+            }),
+            Err(err) => {
+                if mappings_count == 0 && diagnostics.is_empty() {
+                    return Err(err);
+                }
+
+                Ok(SourceMapInspectionReport {
+                    mappings_count,
+                    preview,
+                    sections,
+                    diagnostics,
+                    fallback_mode,
+                    fallback_message,
+                })
+            }
+        }
     }
 
     /// Returns `true` if no mappings were loaded.
@@ -591,6 +709,26 @@ impl SourceMap {
     }
 }
 
+fn dwarf_section_sizes(wasm_bytes: &[u8]) -> Result<HashMap<String, usize>> {
+    let mut sections = HashMap::new();
+    for payload in Parser::new(0).parse_all(wasm_bytes) {
+        let payload = payload
+            .map_err(|e| DebuggerError::WasmLoadError(format!("Failed to parse WASM: {}", e)))?;
+        if let Payload::CustomSection(reader) = payload {
+            let name = reader.name().to_string();
+            if DWARF_SECTION_NAMES.iter().any(|known| *known == name || known.trim_start_matches('.') == name) {
+                let normalized = if name.starts_with('.') {
+                    name
+                } else {
+                    format!(".{}", name)
+                };
+                sections.insert(normalized, reader.data().len());
+            }
+        }
+    }
+    Ok(sections)
+}
+
 #[derive(Debug, Clone)]
 struct WasmIndex {
     function_bodies: Vec<(std::ops::Range<usize>, u32)>,
@@ -744,6 +882,36 @@ mod tests {
         ]
     }
 
+    fn uleb128(mut value: usize) -> Vec<u8> {
+        let mut out = Vec::new();
+        loop {
+            let mut byte = (value & 0x7f) as u8;
+            value >>= 7;
+            if value != 0 {
+                byte |= 0x80;
+            }
+            out.push(byte);
+            if value == 0 {
+                break;
+            }
+        }
+        out
+    }
+
+    fn wasm_with_custom_section(name: &str, payload: &[u8]) -> Vec<u8> {
+        let mut bytes = vec![0x00, 0x61, 0x73, 0x6d, 0x01, 0x00, 0x00, 0x00];
+        bytes.push(0x00);
+
+        let mut section = Vec::new();
+        section.extend_from_slice(&uleb128(name.len()));
+        section.extend_from_slice(name.as_bytes());
+        section.extend_from_slice(payload);
+
+        bytes.extend_from_slice(&uleb128(section.len()));
+        bytes.extend_from_slice(&section);
+        bytes
+    }
+
     #[test]
     fn first_load_increments_parse_count() {
         let mut sm = SourceMap::new();
@@ -760,6 +928,36 @@ mod tests {
         sm.load(&bytes).unwrap();
         sm.load(&bytes).unwrap();
         assert_eq!(sm.parse_count(), 1, "only the first call should parse");
+    }
+
+    #[test]
+    fn inspection_report_lists_missing_dwarf_sections_and_wasm_fallback() {
+        let report = SourceMap::inspect_wasm(&tiny_wasm(), 5).unwrap();
+
+        assert_eq!(report.mappings_count, 0);
+        assert_eq!(report.fallback_mode, "wasm-only");
+        assert!(
+            report
+                .sections
+                .iter()
+                .any(|section| section.name == ".debug_info" && !section.present)
+        );
+        assert!(report.fallback_message.contains("Missing DWARF sections"));
+    }
+
+    #[test]
+    fn inspection_report_marks_present_dwarf_sections() {
+        let wasm = wasm_with_custom_section(".debug_info", &[1, 2, 3, 4]);
+        let report = SourceMap::inspect_wasm(&wasm, 5).unwrap();
+
+        assert!(
+            report
+                .sections
+                .iter()
+                .any(|section| section.name == ".debug_info"
+                    && section.present
+                    && section.size_bytes == 4)
+        );
     }
 
     #[test]

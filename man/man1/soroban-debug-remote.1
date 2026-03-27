@@ -47,3 +47,16 @@ Maximum backoff delay in milliseconds for retries
 .TP
 \fB\-h\fR, \fB\-\-help\fR
 Print help
+.SH TROUBLESHOOTING
+.TP
+\fBRequest timed out\fR
+Increase the narrowest relevant timeout first: \fB\-\-timeout\-ms\fR for general requests, \fB\-\-inspect\-timeout\-ms\fR for inspect traffic, and \fB\-\-storage\-timeout\-ms\fR for storage fetches.
+.TP
+\fBIncompatible debugger protocol\fR
+Client and server builds are out of sync. Rebuild or reinstall both sides from the same release line or repository revision.
+.TP
+\fBAuthentication failed\fR
+Verify that the client \fB\-\-token\fR exactly matches the token configured on the server.
+.TP
+\fBLoopback / network failure\fR
+Confirm the server is listening on the expected host and port, try \fB127.0.0.1\fR instead of \fBlocalhost\fR, and check firewall, container, or CI loopback restrictions.

@@ -23,3 +23,16 @@ TLS private key file path (optional)
 .TP
 \fB\-h\fR, \fB\-\-help\fR
 Print help
+.SH TROUBLESHOOTING
+.TP
+\fBClients cannot connect\fR
+Verify the server is listening on the intended port and that loopback, firewall, container, or CI networking policy allows inbound TCP on that interface.
+.TP
+\fBAuthentication failures\fR
+If you set \fB\-\-token\fR, every client must present the same token. Fix token mismatch before changing retry or timeout settings.
+.TP
+\fBProtocol mismatch reports\fR
+Use matching client and server builds. Mixing a newer extension or CLI client with an older server can fail during handshake.
+.TP
+\fBTimeout complaints from clients\fR
+The server may be healthy but slow for a specific request type. Ask clients to increase their per\-request timeout knobs before broadening all retry windows.
