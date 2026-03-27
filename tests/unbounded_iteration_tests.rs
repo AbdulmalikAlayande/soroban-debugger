@@ -257,7 +257,7 @@ fn detects_storage_call_in_simple_loop() {
 
     // Check confidence is present and in range
     let confidence = finding.confidence.expect("Confidence score missing");
-    assert!(confidence >= 0.0 && confidence <= 1.0);
+    assert!((0.0..=1.0).contains(&confidence));
     assert!(finding.confidence.unwrap_or_default() >= 0.5);
     assert!(finding.description.contains("storage-read host calls"));
 }
