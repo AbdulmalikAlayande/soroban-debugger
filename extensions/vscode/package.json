@@ -154,14 +154,12 @@
     "compile": "tsc -p ./",
     "watch": "tsc -watch -p ./",
     "pretest": "npm run compile",
-    "test": "node ./dist/test/runTest.js",
     "build": "npm run compile",
-    "ci": "npm run build && npm run test"
     "test": "npm run test:smoke && npm run test:dap-e2e",
+    "ci": "npm run build && npm run test",
     "test:all": "node ./dist/test/runTest.js",
     "test:smoke": "node ./dist/test/runSmokeTest.js",
-    "test:dap-e2e": "node ./dist/test/runDapE2E.js",
-    "build": "npm run compile"
+    "test:dap-e2e": "node ./dist/test/runDapE2E.js"
   },
   "devDependencies": {
     "@types/node": "^20.19.37",
