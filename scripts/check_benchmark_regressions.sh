@@ -130,8 +130,6 @@ esac
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 BENCHMARK_THRESHOLD="${BENCHMARK_THRESHOLD:-10}"
-CURRENT_BASELINE_NAME="${CURRENT_BASELINE_NAME:-new}"
-BASELINE_NAME="${BASELINE_NAME:-base}"
 
 if [ -z "${BASELINE_REF:-}" ]; then
     if git -C "$REPO_ROOT" rev-parse --verify --quiet refs/remotes/origin/main >/dev/null; then
@@ -143,8 +141,6 @@ fi
 
 TEMP_DIR="$(mktemp -d)"
 WORKTREE_DIR="$TEMP_DIR/baseline-worktree"
-BENCH_TARGET_DIR="$TEMP_DIR/cargo-target"
-CRITCMP_ROOT="$TEMP_DIR/critcmp-root"
 WORKTREE_ADDED=0
 
 cleanup() {
@@ -166,46 +162,51 @@ echo "Preparing baseline worktree for $BASELINE_REF..."
 git -C "$REPO_ROOT" worktree add --detach "$WORKTREE_DIR" "$BASELINE_REF"
 WORKTREE_ADDED=1
 
+CURRENT_JSON="$TEMP_DIR/current.json"
+BASELINE_JSON="$TEMP_DIR/baseline.json"
+CURRENT_TARGET="$TEMP_DIR/current-target"
+BASELINE_TARGET="$TEMP_DIR/baseline-target"
+
 echo "Running benchmarks for the current checkout..."
 (
     cd "$REPO_ROOT"
-    CARGO_TARGET_DIR="$BENCH_TARGET_DIR" cargo bench -- --save-baseline "$CURRENT_BASELINE_NAME" --noplot
+    CARGO_TARGET_DIR="$CURRENT_TARGET" cargo bench --benches -- --noplot
+    cargo run --quiet --bin bench-regression -- record \
+        --criterion "$CURRENT_TARGET/criterion" \
+        --out "$CURRENT_JSON"
 )
 
 echo "Running benchmarks for the baseline checkout..."
 (
     cd "$WORKTREE_DIR"
-    CARGO_TARGET_DIR="$BENCH_TARGET_DIR" cargo bench -- --save-baseline "$BASELINE_NAME" --noplot
+    CARGO_TARGET_DIR="$BASELINE_TARGET" cargo bench --benches -- --noplot
+    cargo run --quiet --bin bench-regression -- record \
+        --criterion "$BASELINE_TARGET/criterion" \
+        --out "$BASELINE_JSON"
 )
 
-mkdir -p "$CRITCMP_ROOT/target"
+echo "Comparing baselines (threshold: ${BENCHMARK_THRESHOLD}%)..."
+set +e
+output="$(
+    cd "$REPO_ROOT"
+    cargo run --quiet --bin bench-regression -- compare \
+        --baseline "$BASELINE_JSON" \
+        --current "$CURRENT_JSON" \
+        --warn-pct "$BENCHMARK_THRESHOLD" \
+        --fail-pct 20 2>&1
+)"
+status=$?
+set -e
 
-if [ ! -d "$BENCH_TARGET_DIR/criterion" ]; then
-    echo "Criterion output was not produced under $BENCH_TARGET_DIR/criterion."
-    exit 2
+echo "$output"
+
+if [ "$status" -eq 0 ]; then
+    exit 0
 fi
 
-cp -R "$BENCH_TARGET_DIR/criterion" "$CRITCMP_ROOT/target/criterion"
+if echo "$output" | grep -Fq "no benchmark comparisons to show"; then
+    echo "No overlapping benchmark IDs; skipping regression gate."
+    exit 0
+fi
 
-echo "Comparing baselines with critcmp (threshold: ${BENCHMARK_THRESHOLD}%)..."
-(
-    cd "$CRITCMP_ROOT"
-
-    set +e
-    output="$(critcmp "$BASELINE_NAME" "$CURRENT_BASELINE_NAME" --threshold "$BENCHMARK_THRESHOLD" 2>&1)"
-    status=$?
-    set -e
-
-    echo "$output"
-
-    if [ "$status" -eq 0 ]; then
-        exit 0
-    fi
-
-    if echo "$output" | grep -Fq "no benchmark comparisons to show"; then
-        echo "No overlapping benchmark IDs between '$BASELINE_NAME' and '$CURRENT_BASELINE_NAME'; skipping regression gate."
-        exit 0
-    fi
-
-    exit "$status"
-)
+exit "$status"
