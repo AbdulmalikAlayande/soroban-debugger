@@ -128,6 +128,9 @@ jobs:
           toolchain: stable
 
       - uses: Swatinem/rust-cache@v2
+      
+      - name: Install critcmp
+        run: cargo install critcmp --version 0.1.7
 
       - name: Restore benchmark baseline (from default branch)
         if: github.event_name == 'pull_request'
@@ -145,59 +148,6 @@ jobs:
       - name: Run benchmark regression check
         shell: bash
         run: bash scripts/check_benchmark_regressions.sh
-      - name: Run benchmarks (current)
-        run: cargo bench --benches -- --noplot --sample-size $BENCH_SAMPLE_SIZE --measurement-time $BENCH_MEASUREMENT_TIME --warm-up-time $BENCH_WARMUP_TIME
-
-      - name: Add main branch worktree for baseline
-        run: git worktree add /tmp/bench-base main
-
-      - name: Run benchmarks (baseline on main)
-        working-directory: /tmp/bench-base
-        env:
-          CARGO_TARGET_DIR: ${{ github.workspace }}/target
-        run: cargo bench -- --save-baseline base --noplot
-
-      - name: Remove main branch worktree
-        if: always()
-        run: git worktree remove --force /tmp/bench-base || true
-      - name: Record current results (JSON)
-        run: cargo run --quiet --bin bench-regression -- record --criterion target/criterion --out .bench/current.json
-
-      - name: Compare against baseline (pass/warn/fail)
-        if: github.event_name == 'pull_request'
-        shell: bash
-        run: |
-          set -e
-          report="$(cargo run --quiet --bin bench-regression -- compare \
-            --baseline .bench/baseline.json \
-            --current .bench/current.json \
-            --warn-pct "$BENCH_WARN_PCT" \
-            --fail-pct "$BENCH_FAIL_PCT" \
-            --annotate-top 20 \
-            --max-rows 50 \
-            --require-baseline false)"
-          echo "$report"
-          echo "$report" >> "$GITHUB_STEP_SUMMARY"
-
-      - name: Update baseline on main
-        if: github.event_name == 'push' && github.ref == 'refs/heads/main'
-        run: |
-          mkdir -p .bench
-          cp .bench/current.json .bench/baseline.json
-
-      - name: Save baseline cache (main only)
-        if: github.event_name == 'push' && github.ref == 'refs/heads/main'
-        uses: actions/cache/save@v4
-        with:
-          path: .bench/baseline.json
-          key: bench-baseline-${{ runner.os }}-${{ github.sha }}
-
-      - name: Upload baseline artifact (main only)
-        if: github.event_name == 'push' && github.ref == 'refs/heads/main'
-        uses: actions/upload-artifact@v4
-        with:
-          name: bench-baseline-${{ runner.os }}
-          path: .bench/baseline.json
 
   check-manpages:
     name: Check man page sync
@@ -237,14 +187,8 @@ jobs:
           summary_json=$(cargo llvm-cov --workspace --all-features --json --summary-only 2>&1)
           echo "$summary_json"
 
-          # Extract line coverage; || true lets us emit a clear error instead of a raw jq failure
-          coverage=$(printf '%s' "$summary_json" | jq -r '.data[0].totals.lines.percent' 2>/dev/null || true)
-
-          if [ -z "$coverage" ] || [ "$coverage" = "null" ]; then
-            echo "ERROR: Failed to extract coverage from cargo-llvm-cov JSON output."
-            echo "Verify that 'cargo llvm-cov --json --summary-only' still emits .data[0].totals.lines.percent"
-            exit 1
-          fi
+          # Parse and validate required schema fields through the shared script helper.
+          coverage="$(printf '%s' "$summary_json" | bash scripts/check_benchmark_regressions.sh coverage-percent-from-json)"
 
           coverage_pct=$(printf "%.2f" "$coverage")
           echo "Current coverage: ${coverage_pct}%"
@@ -258,6 +202,10 @@ jobs:
           else
             echo "Coverage ${coverage_pct}% meets the required 50% threshold"
           fi
+
+      - name: Validate coverage parser on missing required field
+        shell: bash
+        run: bash scripts/check_benchmark_regressions.sh selftest-coverage-missing-field
       
       - name: Upload to Codecov
         uses: codecov/codecov-action@v4
