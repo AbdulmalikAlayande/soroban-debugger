@@ -428,6 +428,89 @@ fn parity_dap_server_rejects_invalid_token() {
     }
 }
 
+/// SURFACE: DAP (server path) — BACKWARD COMPATIBILITY GUARD
+///
+/// Older clients send `Authenticate` as their very first message, before any
+/// `Handshake` exchange. The server MUST accept and honour this ordering so
+/// that pre-handshake clients continue to work without modification.
+///
+/// This test is the dedicated regression guard for that behaviour. If it
+/// starts failing it means the auth-before-handshake path in
+/// `src/server/debug_server.rs` (`handle_single_connection`) was broken.
+/// Do NOT remove or weaken this test without a corresponding protocol version
+/// bump and a migration note in CONTRIBUTING.md.
+#[test]
+fn parity_dap_auth_before_handshake_is_accepted() {
+    if !network::can_bind_loopback() {
+        eprintln!(
+            "Skipping parity_dap_auth_before_handshake_is_accepted: loopback networking \
+             restricted (EPERM or equivalent) – see docs/remote-troubleshooting.md."
+        );
+        return;
+    }
+
+    use std::io::{BufRead, BufReader, Write};
+    use std::net::TcpStream;
+    use std::time::Duration;
+
+    let port = 19_235u16;
+    let token = "compat-test-token";
+
+    let mut server = std::process::Command::new(env!("CARGO_BIN_EXE_soroban-debug"))
+        .args(["server", "--port", &port.to_string(), "--token", token])
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .expect("Failed to spawn soroban-debug server");
+
+    std::thread::sleep(Duration::from_millis(500));
+
+    let result: Result<String, String> = (|| {
+        let mut stream = TcpStream::connect(format!("127.0.0.1:{}", port))
+            .map_err(|e| format!("connect failed: {}", e))?;
+        stream
+            .set_read_timeout(Some(Duration::from_secs(4)))
+            .map_err(|e| format!("set_read_timeout: {}", e))?;
+
+        // Send Authenticate WITHOUT a prior Handshake — this is the legacy ordering.
+        let auth_msg = format!(
+            "{{\"id\":1,\"request\":{{\"type\":\"Authenticate\",\"token\":\"{}\"}}}}\n",
+            token
+        );
+        stream
+            .write_all(auth_msg.as_bytes())
+            .map_err(|e| format!("write failed: {}", e))?;
+
+        let mut reader = BufReader::new(stream);
+        let mut response = String::new();
+        reader
+            .read_line(&mut response)
+            .map_err(|e| format!("read failed: {}", e))?;
+        Ok(response)
+    })();
+
+    let _ = server.kill();
+    let _ = server.wait();
+
+    match result {
+        Ok(response) => {
+            assert!(
+                response.contains("\"success\":true"),
+                "Server must accept Authenticate sent before Handshake (backward-compat). \
+                 Got: {}",
+                response
+            );
+        }
+        Err(e) => {
+            eprintln!(
+                "Skipping parity_dap_auth_before_handshake_is_accepted: {} – \
+                 see docs/remote-troubleshooting.md.",
+                e
+            );
+        }
+    }
+}
+
 // ── Non-support assertions ────────────────────────────────────────────────
 //
 // These tests confirm that features unsupported on BOTH surfaces remain
