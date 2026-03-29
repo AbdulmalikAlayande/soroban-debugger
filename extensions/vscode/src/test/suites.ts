@@ -29,6 +29,10 @@ type TestFixtures = {
 };
 
 const BREAKPOINT_SYNC_TEST_LOG_ENV = "SOROBAN_DEBUG_BREAKPOINT_SYNC_TEST_LOG";
+const FIXTURE_BREAKPOINT_MARKERS = {
+  nonExportedHelper: "BREAKPOINT_MARKER: non-exported-helper",
+  exportedEcho: "BREAKPOINT_MARKER: exported-echo",
+} as const;
 
 async function startMockDebuggerServer(options: {
   evaluateDelayMs: number;
@@ -231,6 +235,17 @@ function resolveFixtures(): TestFixtures {
     sourcePath,
     binaryPath,
   };
+}
+
+function findFixtureLine(sourcePath: string, marker: string): number {
+  const lines = fs.readFileSync(sourcePath, "utf8").split(/\r?\n/);
+  const lineNumber = lines.findIndex((line) => line.includes(marker)) + 1;
+  assert.notEqual(
+    lineNumber,
+    0,
+    `Expected fixture marker '${marker}' in ${sourcePath}`,
+  );
+  return lineNumber;
 }
 
 export async function runSmokeSuite(): Promise<void> {
@@ -575,10 +590,18 @@ export async function runSmokeSuite(): Promise<void> {
   await debuggerProcess.start();
   await debuggerProcess.ping();
 
+  const exportedEchoLine = findFixtureLine(
+    fixtures.sourcePath,
+    FIXTURE_BREAKPOINT_MARKERS.exportedEcho,
+  );
+  const nonExportedHelperLine = findFixtureLine(
+    fixtures.sourcePath,
+    FIXTURE_BREAKPOINT_MARKERS.nonExportedHelper,
+  );
   const exportedFunctions = await debuggerProcess.getContractFunctions();
   const resolvedBreakpoints = resolveSourceBreakpoints(
     fixtures.sourcePath,
-    [14],
+    [exportedEchoLine],
     exportedFunctions,
   );
   assert.equal(
@@ -595,7 +618,7 @@ export async function runSmokeSuite(): Promise<void> {
 
   const nonExportedBreakpoints = resolveSourceBreakpoints(
     fixtures.sourcePath,
-    [10],
+    [nonExportedHelperLine],
     exportedFunctions,
   );
   assert.equal(
@@ -622,7 +645,7 @@ export async function runSmokeSuite(): Promise<void> {
   // Test HEURISTIC_NO_FUNCTION behavior for lines outside any function
   const noFunctionBreakpoints = resolveSourceBreakpoints(
     fixtures.sourcePath,
-    [1, 2, 12, 16], // Lines outside any function in lib.rs
+    [1, 2, 13, 18], // Lines outside any function in lib.rs
     exportedFunctions,
   );
 
@@ -844,7 +867,14 @@ async function runDapHappyPathE2E(
 
     const setBps = await client.request("setBreakpoints", {
       source: { path: fixtures.sourcePath },
-      breakpoints: [{ line: 14 }],
+      breakpoints: [
+        {
+          line: findFixtureLine(
+            fixtures.sourcePath,
+            FIXTURE_BREAKPOINT_MARKERS.exportedEcho,
+          ),
+        },
+      ],
     });
     assert.equal(
       setBps.success,
@@ -878,7 +908,14 @@ async function runDapHappyPathE2E(
 
     const privateBps = await client.request("setBreakpoints", {
       source: { path: fixtures.sourcePath },
-      breakpoints: [{ line: 10 }],
+      breakpoints: [
+        {
+          line: findFixtureLine(
+            fixtures.sourcePath,
+            FIXTURE_BREAKPOINT_MARKERS.nonExportedHelper,
+          ),
+        },
+      ],
     });
     assert.equal(
       privateBps.success,
