@@ -658,16 +658,6 @@ pub fn run(args: RunArgs, verbosity: Verbosity) -> Result<()> {
 
     let mut engine = DebuggerEngine::new(executor, args.breakpoint.clone());
 
-    // Server mode is handled at the beginning of the function
-    // Remote mode is not yet implemented
-
-    if args.remote.is_some() {
-        return Err(DebuggerError::ExecutionError(
-            "Remote mode not yet implemented in run command".to_string(),
-        )
-        .into());
-    }
-
     // Execute locally with debugging
     // if !args.is_json_output() {
     //     println!("\n--- Execution Start ---\n");
