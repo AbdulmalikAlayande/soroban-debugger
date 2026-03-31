@@ -6,7 +6,12 @@ use std::time::Duration;
 
 fn get_free_port() -> Option<u16> {
     match std::net::TcpListener::bind("127.0.0.1:0") {
-        Ok(listener) => Some(listener.local_addr().expect("Failed to read local address").port()),
+        Ok(listener) => Some(
+            listener
+                .local_addr()
+                .expect("Failed to read local address")
+                .port(),
+        ),
         Err(err) if err.kind() == std::io::ErrorKind::PermissionDenied => {
             eprintln!("Skipping network test: loopback bind is not permitted in this environment");
             None
