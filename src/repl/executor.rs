@@ -55,7 +55,7 @@ impl ReplExecutor {
         }
 
         let alias_path = dirs::home_dir()
-            .unwrap_or_else(|| std::env::temp_dir())
+            .unwrap_or_else(std::env::temp_dir)
             .join(".soroban_repl_aliases.json");
 
         let address_aliases = if alias_path.exists() {

@@ -48,7 +48,7 @@ impl Default for RetryPolicy {
     }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 pub struct RemoteClientConfig {
     pub timeouts: RequestTimeouts,
     pub retry: RetryPolicy,
@@ -57,20 +57,6 @@ pub struct RemoteClientConfig {
     pub tls_cert: Option<PathBuf>,
     pub tls_key: Option<PathBuf>,
     pub tls_ca: Option<PathBuf>,
-}
-
-impl Default for RemoteClientConfig {
-    fn default() -> Self {
-        Self {
-            timeouts: RequestTimeouts::default(),
-            retry: RetryPolicy::default(),
-            heartbeat_interval_ms: None,
-            idle_timeout_ms: None,
-            tls_cert: None,
-            tls_key: None,
-            tls_ca: None,
-        }
-    }
 }
 
 /// Remote client for connecting to a debug server
@@ -87,7 +73,7 @@ pub struct RemoteClient {
 #[derive(Debug)]
 enum RemoteStream {
     Plain(TcpStream),
-    Tls(rustls::StreamOwned<rustls::client::ClientConnection, TcpStream>),
+    Tls(Box<rustls::StreamOwned<rustls::client::ClientConnection, TcpStream>>),
 }
 
 impl Read for RemoteStream {
@@ -243,7 +229,9 @@ impl RemoteClient {
                 DebuggerError::NetworkError(format!("Failed to create TLS connection: {}", e))
             })?;
 
-            Ok(RemoteStream::Tls(rustls::StreamOwned::new(conn, tcp_stream)))
+            Ok(RemoteStream::Tls(Box::new(rustls::StreamOwned::new(
+                conn, tcp_stream,
+            ))))
         } else {
             Ok(RemoteStream::Plain(tcp_stream))
         }

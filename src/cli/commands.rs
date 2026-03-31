@@ -1838,10 +1838,12 @@ pub fn server(args: ServerArgs) -> Result<()> {
 /// Connect to remote debug server
 pub fn remote(args: RemoteArgs, _verbosity: Verbosity) -> Result<()> {
     print_info(format!("Connecting to remote debugger at {}", args.remote));
-    let mut config = crate::client::RemoteClientConfig::default();
-    config.tls_cert = args.tls_cert.clone();
-    config.tls_key = args.tls_key.clone();
-    config.tls_ca = args.tls_ca.clone();
+    let config = crate::client::RemoteClientConfig {
+        tls_cert: args.tls_cert.clone(),
+        tls_key: args.tls_key.clone(),
+        tls_ca: args.tls_ca.clone(),
+        ..Default::default()
+    };
     let mut client = crate::client::RemoteClient::connect_with_config(&args.remote, args.token.clone(), config)?;
 
     if let Some(contract) = &args.contract {

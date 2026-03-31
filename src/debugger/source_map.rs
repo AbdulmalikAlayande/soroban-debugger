@@ -1049,9 +1049,7 @@ mod tests {
 
         let mut function_section = Vec::new();
         function_section.extend_from_slice(&uleb128(function_count as usize));
-        for _ in 0..function_count {
-            function_section.push(0x00);
-        }
+        function_section.extend(std::iter::repeat_n(0x00, function_count as usize));
         push_section(&mut bytes, 0x03, &function_section);
 
         if !exports.is_empty() {
