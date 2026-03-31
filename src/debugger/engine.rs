@@ -284,17 +284,6 @@ impl DebuggerEngine {
                     .breakpoints()
                     .get_breakpoint(function)
                     .and_then(|bp| bp.condition.clone());
-        let (step_count, current_args) = self
-            .state
-            .lock()
-            .map(|s| (s.step_count(), s.current_args().map(String::from)))
-            .unwrap_or((0, None));
-
-        if check_breakpoints {
-            if let Some(bp) = self.breakpoints().get_breakpoint(function) {
-                let condition = bp.condition.clone();
-                let _ = step_count;
-                let _ = current_args;
                 self.pause_at_function(function, condition);
             }
         }
