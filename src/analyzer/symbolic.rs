@@ -925,7 +925,7 @@ mod tests {
     #[test]
     fn analyze_with_config_records_path_cap_metadata() {
         let analyzer = SymbolicAnalyzer::new();
-        let wasm = wasm_with_import_and_exported_local();
+        let wasm = include_bytes!("../../tests/fixtures/wasm/echo.wasm").to_vec();
         let config = SymbolicConfig {
             max_paths: 3,
             max_input_combinations: 16,
@@ -937,7 +937,7 @@ mod tests {
         };
 
         let report = analyzer
-            .analyze_with_config(&wasm, "entry", &config)
+            .analyze_with_config(&wasm, "echo", &config)
             .expect("symbolic analysis should complete");
 
         assert_eq!(report.paths_explored, 3);
@@ -978,7 +978,7 @@ mod tests {
 
     #[test]
     fn analyze_with_seed_produces_reproducible_exploration_order() {
-        let wasm = wasm_with_import_and_exported_local();
+        let wasm = include_bytes!("../../tests/fixtures/wasm/echo.wasm").to_vec();
         let analyzer = SymbolicAnalyzer::new();
         let config_a = SymbolicConfig {
             max_paths: 10,
@@ -995,10 +995,10 @@ mod tests {
         };
 
         let report_a = analyzer
-            .analyze_with_config(&wasm, "entry", &config_a)
+            .analyze_with_config(&wasm, "echo", &config_a)
             .unwrap();
         let report_b = analyzer
-            .analyze_with_config(&wasm, "entry", &config_b)
+            .analyze_with_config(&wasm, "echo", &config_b)
             .unwrap();
 
         let inputs_a: Vec<_> = report_a.paths.iter().map(|p| p.inputs.clone()).collect();
@@ -1012,7 +1012,7 @@ mod tests {
 
     #[test]
     fn analyze_without_seed_uses_default_order() {
-        let wasm = wasm_with_import_and_exported_local();
+        let wasm = include_bytes!("../../tests/fixtures/wasm/echo.wasm").to_vec();
         let analyzer = SymbolicAnalyzer::new();
         let config = SymbolicConfig {
             max_paths: 5,
@@ -1025,7 +1025,7 @@ mod tests {
         };
 
         let report = analyzer
-            .analyze_with_config(&wasm, "entry", &config)
+            .analyze_with_config(&wasm, "echo", &config)
             .unwrap();
         assert_eq!(report.metadata.seed, None);
     }
@@ -1133,7 +1133,7 @@ mod tests {
 
     #[test]
     fn analyze_with_storage_seed_uses_initial_state() {
-        let wasm = wasm_with_import_and_exported_local();
+        let wasm = include_bytes!("../../tests/fixtures/wasm/echo.wasm").to_vec();
         let analyzer = SymbolicAnalyzer::new();
         let config = SymbolicConfig {
             max_paths: 5,
@@ -1148,7 +1148,7 @@ mod tests {
         // The test verifies that the config accepts a storage seed.
         // Actual storage seeding behavior depends on ContractExecutor implementation.
         let report = analyzer
-            .analyze_with_config(&wasm, "entry", &config)
+            .analyze_with_config(&wasm, "echo", &config)
             .expect("symbolic analysis with storage seed should complete");
 
         assert_eq!(
