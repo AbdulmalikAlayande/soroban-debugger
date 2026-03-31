@@ -1303,7 +1303,7 @@ mod tests {
 
         let exported_functions = HashSet::from([String::from("alpha"), String::from("beta")]);
         let resolved =
-            sm.resolve_source_breakpoints(&wasm, &source_path, &[10], &exported_functions);
+            sm.resolve_source_breakpoints(&wasm, &source_path, &[10], &exported_functions, None);
 
         assert_eq!(resolved.len(), 1);
         assert_eq!(resolved[0].requested_line, 10);
@@ -1344,7 +1344,7 @@ mod tests {
         let exported_functions = HashSet::from([String::from("alpha"), String::from("beta")]);
         let requested_path = PathBuf::from("crate_a/src/lib.rs");
         let resolved =
-            sm.resolve_source_breakpoints(&wasm, &requested_path, &[10], &exported_functions);
+            sm.resolve_source_breakpoints(&wasm, &requested_path, &[10], &exported_functions, None);
 
         assert_eq!(resolved.len(), 1);
         assert!(resolved[0].verified);

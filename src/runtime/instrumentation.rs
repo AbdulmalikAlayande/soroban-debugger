@@ -290,7 +290,9 @@ mod tests {
 
     #[test]
     fn parse_only_rejects_invalid_wasm() {
-        let err = Instrumenter::parse_only(&[0xde, 0xad, 0xbe, 0xef]).unwrap_err();
+        let result = Instrumenter::parse_only(&[0xde, 0xad, 0xbe, 0xef]);
+        assert!(result.is_err());
+        let err = result.err().unwrap_or_else(|| "missing error".to_string());
         assert!(err.contains("WASM"));
     }
 }
