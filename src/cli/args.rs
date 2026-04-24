@@ -233,6 +233,10 @@ pub struct RunArgs {
     #[arg(short, long)]
     pub breakpoint: Vec<String>,
 
+    /// Set a log-only breakpoint at function (logs context without pausing). Format: FUNCTION=MESSAGE
+    #[arg(long, value_name = "FUNCTION=MESSAGE")]
+    pub log_point: Vec<String>,
+
     /// Network snapshot file to load before execution
     #[arg(long)]
     pub network_snapshot: Option<PathBuf>,
@@ -390,6 +394,31 @@ impl RunArgs {
                 .unwrap_or(false)
     }
 
+    /// Parse log point specifications into BreakpointSpecs
+    pub fn parse_log_points(&self) -> Vec<crate::debugger::breakpoint::BreakpointSpec> {
+        self.log_point
+            .iter()
+            .filter_map(|spec| {
+                let parts: Vec<&str> = spec.splitn(2, '=').collect();
+                if parts.len() == 2 {
+                    Some(crate::debugger::breakpoint::BreakpointSpec {
+                        id: parts[0].to_string(),
+                        function: parts[0].to_string(),
+                        condition: None,
+                        hit_condition: None,
+                        log_message: Some(parts[1].to_string()),
+                    })
+                } else {
+                    eprintln!(
+                        "Warning: Invalid log point format '{}', expected FUNCTION=MESSAGE",
+                        spec
+                    );
+                    None
+                }
+            })
+            .collect()
+    }
+
     pub fn merge_config(&mut self, config: &Config) {
         // Breakpoints
         if self.breakpoint.is_empty() && !config.debug.breakpoints.is_empty() {
@@ -457,6 +486,10 @@ pub struct InteractiveArgs {
     #[arg(short, long)]
     pub breakpoint: Vec<String>,
 
+    /// Set a log-only breakpoint at function (logs context without pausing). Format: FUNCTION=MESSAGE
+    #[arg(long, value_name = "FUNCTION=MESSAGE")]
+    pub log_point: Vec<String>,
+
     /// Mock cross-contract return: CONTRACT_ID.function=return_value (repeatable)
     #[arg(long, value_name = "CONTRACT_ID.function=return_value")]
     pub mock: Vec<String>,
@@ -483,6 +516,31 @@ pub struct InteractiveArgs {
 }
 
 impl InteractiveArgs {
+    /// Parse log point specifications into BreakpointSpecs
+    pub fn parse_log_points(&self) -> Vec<crate::debugger::breakpoint::BreakpointSpec> {
+        self.log_point
+            .iter()
+            .filter_map(|spec| {
+                let parts: Vec<&str> = spec.splitn(2, '=').collect();
+                if parts.len() == 2 {
+                    Some(crate::debugger::breakpoint::BreakpointSpec {
+                        id: parts[0].to_string(),
+                        function: parts[0].to_string(),
+                        condition: None,
+                        hit_condition: None,
+                        log_message: Some(parts[1].to_string()),
+                    })
+                } else {
+                    eprintln!(
+                        "Warning: Invalid log point format '{}', expected FUNCTION=MESSAGE",
+                        spec
+                    );
+                    None
+                }
+            })
+            .collect()
+    }
+
     pub fn merge_config(&mut self, _config: &Config) {
         // Future interactive-specific config could go here
     }
@@ -896,9 +954,40 @@ pub struct TuiArgs {
     #[arg(short, long)]
     pub breakpoint: Vec<String>,
 
+    /// Set a log-only breakpoint at function (logs context without pausing). Format: FUNCTION=MESSAGE
+    #[arg(long, value_name = "FUNCTION=MESSAGE")]
+    pub log_point: Vec<String>,
+
     /// Network snapshot file to load before execution
     #[arg(long)]
     pub network_snapshot: Option<PathBuf>,
+}
+
+impl TuiArgs {
+    /// Parse log point specifications into BreakpointSpecs
+    pub fn parse_log_points(&self) -> Vec<crate::debugger::breakpoint::BreakpointSpec> {
+        self.log_point
+            .iter()
+            .filter_map(|spec| {
+                let parts: Vec<&str> = spec.splitn(2, '=').collect();
+                if parts.len() == 2 {
+                    Some(crate::debugger::breakpoint::BreakpointSpec {
+                        id: parts[0].to_string(),
+                        function: parts[0].to_string(),
+                        condition: None,
+                        hit_condition: None,
+                        log_message: Some(parts[1].to_string()),
+                    })
+                } else {
+                    eprintln!(
+                        "Warning: Invalid log point format '{}', expected FUNCTION=MESSAGE",
+                        spec
+                    );
+                    None
+                }
+            })
+            .collect()
+    }
 }
 
 #[derive(Parser)]

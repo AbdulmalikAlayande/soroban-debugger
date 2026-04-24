@@ -645,7 +645,8 @@ pub fn run(args: RunArgs, verbosity: Verbosity) -> Result<()> {
         executor.set_mock_specs(&args.mock)?;
     }
 
-    let mut engine = DebuggerEngine::new(executor, args.breakpoint.clone());
+    let log_points = args.parse_log_points();
+    let mut engine = DebuggerEngine::new(executor, args.breakpoint.clone(), log_points);
 
     // Server mode is handled at the beginning of the function
     // Remote mode is not yet implemented
@@ -1280,7 +1281,7 @@ fn invoke_wasm(wasm: &[u8], function: &str, args: &str) -> String {
     match ContractExecutor::new(wasm.to_vec()) {
         Err(e) => format!("Err(executor: {})", e),
         Ok(executor) => {
-            let mut engine = DebuggerEngine::new(executor, vec![]);
+            let mut engine = DebuggerEngine::new(executor, vec![], vec![]);
             let parsed = if args == "null" || args == "[]" {
                 None
             } else {
@@ -1720,7 +1721,7 @@ pub fn replay(args: ReplayArgs, verbosity: Verbosity) -> Result<()> {
         executor.set_initial_storage(storage)?;
     }
 
-    let mut engine = DebuggerEngine::new(executor, vec![]);
+    let mut engine = DebuggerEngine::new(executor, vec![], vec![]);
 
     logging::log_execution_start(function, args_str);
     let replayed_result = engine.execute(function, args_str)?;
@@ -1912,7 +1913,8 @@ pub fn interactive(args: InteractiveArgs, _verbosity: Verbosity) -> Result<()> {
         executor.set_mock_specs(&args.mock)?;
     }
 
-    let mut engine = DebuggerEngine::new(executor, args.breakpoint.clone());
+    let log_points = args.parse_log_points();
+    let mut engine = DebuggerEngine::new(executor, args.breakpoint.clone(), log_points);
 
     if args.instruction_debug {
         print_info("Enabling instruction-level debugging...");
@@ -1968,7 +1970,8 @@ pub fn tui(args: TuiArgs, _verbosity: Verbosity) -> Result<()> {
         executor.set_initial_storage(storage)?;
     }
 
-    let mut engine = DebuggerEngine::new(executor, args.breakpoint.clone());
+    let log_points = args.parse_log_points();
+    let mut engine = DebuggerEngine::new(executor, args.breakpoint.clone(), log_points);
     engine.stage_execution(&args.function, parsed_args.as_deref());
 
     run_dashboard(engine, &args.function)
