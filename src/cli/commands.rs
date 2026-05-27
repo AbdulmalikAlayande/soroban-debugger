@@ -6,8 +6,9 @@ use crate::analyzer::{
 };
 use crate::cli::args::{
     AnalyzeArgs, CompareArgs, HistoryPruneArgs, InspectArgs, InteractiveArgs, OptimizeArgs,
-    OutputFormat, ProfileArgs, RemoteAction, RemoteArgs, ReplArgs, ReplayArgs, RunArgs,
-    ScenarioArgs, ServerArgs, SymbolicArgs, SymbolicProfile, TuiArgs, UpgradeCheckArgs, Verbosity,
+    OutputFormat, PreflightArgs, ProfileArgs, RemoteAction, RemoteArgs, ReplArgs, ReplayArgs,
+    RunArgs, ScenarioArgs, ServerArgs, SymbolicArgs, SymbolicProfile, TuiArgs, UpgradeCheckArgs,
+    Verbosity,
 };
 use crate::cli::output::write_json_pretty_file;
 use crate::debugger::engine::DebuggerEngine;
@@ -2037,7 +2038,33 @@ pub fn server(args: ServerArgs) -> Result<()> {
 }
 
 /// Connect to remote debug server
-pub fn remote(args: RemoteArgs, _verbosity: Verbosity) -> Result<()> {
+pub fn remote(args: RemoteArgs, verbosity: Verbosity) -> Result<()> {
+    // #1257 — validate retry configuration before attempting any connection.
+    if args.retry_attempts == 0 {
+        return Err(miette::miette!(
+            "Invalid --retry-attempts value: 0 is not allowed.\n\
+             \n\
+             At least one attempt is required for the remote command to make any request.\n\
+             Use --retry-attempts 1 to disable retries (single attempt, no retry on failure).\n\
+             \n\
+             Tip: the default is 3 attempts with exponential back-off."
+        ));
+    }
+    if args.retry_max_delay_ms < args.retry_base_delay_ms {
+        return Err(miette::miette!(
+            "Invalid retry delay configuration: --retry-max-delay-ms ({max}ms) is less than \
+             --retry-base-delay-ms ({base}ms).\n\
+             \n\
+             The maximum back-off delay must be greater than or equal to the base delay.\n\
+             Suggestion: set --retry-max-delay-ms to at least {base}ms, or reduce \
+             --retry-base-delay-ms.\n\
+             \n\
+             Defaults: --retry-base-delay-ms 200  --retry-max-delay-ms 2000",
+            base = args.retry_base_delay_ms,
+            max = args.retry_max_delay_ms,
+        ));
+    }
+
     print_info(format!("Connecting to remote debugger at {}", args.remote));
 
     // Build per-request timeouts, falling back to the general --timeout-ms for
@@ -2078,6 +2105,11 @@ pub fn remote(args: RemoteArgs, _verbosity: Verbosity) -> Result<()> {
             }
         })?;
 
+    // #1255 — show the negotiated protocol version in verbose output.
+    if let Some(proto) = client.selected_protocol_version() {
+        print_verbose(format!("Protocol version negotiated: {}", proto));
+    }
+
     if let Some(info) = client.session_info() {
         print_info(format!(
             "Remote session: {} (created {}, label={})",
@@ -2103,6 +2135,12 @@ pub fn remote(args: RemoteArgs, _verbosity: Verbosity) -> Result<()> {
                 if let Some(reason) = pause_reason {
                     println!("Pause reason: {}", reason);
                 }
+                // #1255 — include protocol in verbose inspect output.
+                if verbosity == Verbosity::Verbose {
+                    if let Some(proto) = client.selected_protocol_version() {
+                        println!("Protocol version: {}", proto);
+                    }
+                }
                 if !call_stack.is_empty() {
                     println!("Call stack:");
                     for frame in &call_stack {
@@ -2126,6 +2164,9 @@ pub fn remote(args: RemoteArgs, _verbosity: Verbosity) -> Result<()> {
                 }
                 Ok(())
             }
+            RemoteAction::Preflight(preflight_args) => {
+                run_remote_preflight(&args, preflight_args, client)
+            }
         };
     }
 
@@ -2140,6 +2181,135 @@ pub fn remote(args: RemoteArgs, _verbosity: Verbosity) -> Result<()> {
     print_success("Remote debugger is reachable");
     Ok(())
 }
+/// Output produced by the `remote preflight` subcommand.
+#[derive(Debug, serde::Serialize)]
+struct PreflightReport {
+    address: String,
+    connect: PreflightCheck,
+    handshake: PreflightCheck,
+    protocol_version: Option<u32>,
+    auth: Option<PreflightCheck>,
+    tls: Option<PreflightCheck>,
+    ping: PreflightCheck,
+    overall: bool,
+}
+
+#[derive(Debug, serde::Serialize)]
+struct PreflightCheck {
+    ok: bool,
+    message: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    suggestion: Option<String>,
+}
+
+impl PreflightCheck {
+    fn ok(message: impl Into<String>) -> Self {
+        Self { ok: true, message: message.into(), suggestion: None }
+    }
+    fn err(message: impl Into<String>, suggestion: impl Into<String>) -> Self {
+        Self {
+            ok: false,
+            message: message.into(),
+            suggestion: Some(suggestion.into()),
+        }
+    }
+}
+
+/// Implements `remote preflight` (#1254): checks connect, handshake, auth, and TLS
+/// without loading any contract.
+fn run_remote_preflight(
+    args: &RemoteArgs,
+    preflight_args: &PreflightArgs,
+    mut client: crate::client::RemoteClient,
+) -> Result<()> {
+    // The client was already successfully connected and the handshake completed —
+    // `connect_with_config` performs handshake and auth internally, so we just
+    // need to record the outcomes and then ping to confirm the channel is live.
+    let connect_check = PreflightCheck::ok(format!("TCP connection established to {}", args.remote));
+
+    let handshake_check = PreflightCheck::ok("Protocol handshake succeeded");
+    let protocol_version = client.selected_protocol_version();
+
+    let auth_check = if args.token.is_some() {
+        Some(PreflightCheck::ok("Authentication succeeded"))
+    } else {
+        None
+    };
+
+    let tls_check = if args.tls_cert.is_some() || args.tls_key.is_some() || args.tls_ca.is_some() {
+        Some(PreflightCheck::ok("TLS handshake succeeded"))
+    } else {
+        None
+    };
+
+    // A final ping confirms end-to-end liveness.
+    let ping_check = match client.ping() {
+        Ok(_) => PreflightCheck::ok("End-to-end ping succeeded"),
+        Err(e) => PreflightCheck::err(
+            format!("End-to-end ping failed: {}", e),
+            "Verify the server process is running and the port is reachable. \
+             Use --connect-timeout-ms to extend the TCP window if the server is slow to respond.",
+        ),
+    };
+    let overall = ping_check.ok;
+
+    let report = PreflightReport {
+        address: args.remote.clone(),
+        connect: connect_check,
+        handshake: handshake_check,
+        protocol_version,
+        auth: auth_check,
+        tls: tls_check,
+        ping: ping_check,
+        overall,
+    };
+
+    if preflight_args.output_format == OutputFormat::Json {
+        let json = serde_json::to_string_pretty(&report)
+            .map_err(|e| miette::miette!("Failed to serialize preflight report: {}", e))?;
+        println!("{}", json);
+        return Ok(());
+    }
+
+    // Pretty output
+    let check = |c: &PreflightCheck| {
+        if c.ok {
+            println!("  [PASS] {}", c.message);
+        } else {
+            println!("  [FAIL] {}", c.message);
+            if let Some(ref hint) = c.suggestion {
+                println!("         Suggestion: {}", hint);
+            }
+        }
+    };
+
+    println!("Preflight check: {}", report.address);
+    println!();
+    check(&report.connect);
+    check(&report.handshake);
+    if let Some(proto) = report.protocol_version {
+        println!("  [INFO] Negotiated protocol version: {}", proto);
+    }
+    if let Some(ref a) = report.auth {
+        check(a);
+    } else {
+        println!("  [SKIP] Auth (no --token provided)");
+    }
+    if let Some(ref t) = report.tls {
+        check(t);
+    } else {
+        println!("  [SKIP] TLS (no TLS flags provided)");
+    }
+    check(&report.ping);
+    println!();
+    if overall {
+        print_success("Preflight passed.");
+    } else {
+        println!("Preflight FAILED. Check the items above for actionable suggestions.");
+    }
+    Ok(())
+}
+
 /// Launch interactive debugger UI
 pub fn interactive(args: InteractiveArgs, _verbosity: Verbosity) -> Result<()> {
     print_info(format!("Loading contract: {:?}", args.contract));
@@ -2957,6 +3127,7 @@ pub fn doctor(args: crate::cli::args::DoctorArgs) -> Result<()> {
             config,
         ) {
             Ok(mut client) => {
+                let selected_protocol = client.selected_protocol_version();
                 let ping = match client.ping() {
                     Ok(_) => Some(check_ok("Ping succeeded")),
                     Err(e) => Some(check_err(format!("Ping failed: {}", e))),
@@ -2970,7 +3141,7 @@ pub fn doctor(args: crate::cli::args::DoctorArgs) -> Result<()> {
                         .token
                         .as_ref()
                         .map(|_| check_ok("Authentication succeeded")),
-                    selected_protocol: None,
+                    selected_protocol,
                 })
             }
             Err(e) => Some(RemoteDoctorReport {
@@ -3012,6 +3183,9 @@ pub fn doctor(args: crate::cli::args::DoctorArgs) -> Result<()> {
         println!("Remote connect: {}", remote.connect.message);
         if let Some(handshake) = remote.handshake {
             println!("Remote handshake: {}", handshake.message);
+        }
+        if let Some(proto) = remote.selected_protocol {
+            println!("Remote protocol version: {}", proto);
         }
         if let Some(ping) = remote.ping {
             println!("Remote ping: {}", ping.message);
