@@ -555,6 +555,7 @@ impl OutputConfig {
     }
 }
 
+
 /// Status kind for text-equivalent labels (screen reader friendly).
 #[derive(Clone, Copy)]
 pub enum StatusLabel {

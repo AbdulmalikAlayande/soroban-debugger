@@ -17,6 +17,7 @@ use chrono::Utc;
 use std::fs;
 use std::io::BufReader as StdBufReader;
 use std::path::Path;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use tokio::io::AsyncBufReadExt;
 use tokio::net::TcpListener;
@@ -52,6 +53,9 @@ pub struct DebugServer {
     last_disconnect: Option<std::time::Instant>,
     /// Log of successful reconnection events in the current session.
     reconnection_log: ReconnectionLog,
+    mock_specs: Vec<String>,
+    show_events: bool,
+    event_filter: Vec<String>,
 }
 
 struct PendingExecution {
@@ -105,6 +109,9 @@ impl DebugServer {
             session_label: None,
             last_disconnect: None,
             reconnection_log: ReconnectionLog::new(),
+            mock_specs,
+            show_events,
+            event_filter,
         })
     }
 
@@ -197,6 +204,13 @@ impl DebugServer {
         };
         let (reader, writer) = tokio::io::split(stream);
         let mut reader = tokio::io::BufReader::new(reader);
+        let mut session_ctx = SessionContext {
+            info: RemoteSessionInfo {
+                session_id: self.session_id.clone(),
+                created_at: Utc::now().to_rfc3339(),
+                label: None,
+            },
+        };
 
         let (tx_in, mut rx_in) = tokio::sync::mpsc::unbounded_channel::<String>();
         let (tx_out, mut rx_out) = tokio::sync::mpsc::unbounded_channel::<DebugMessage>();
@@ -345,6 +359,7 @@ impl DebugServer {
                 heartbeat_interval_ms,
                 idle_timeout_ms,
                 session_label,
+                reconnect_session_id: _,
             } = &request
             {
                 if let Some(label) = session_label
@@ -363,6 +378,29 @@ impl DebugServer {
                         handshake_done = true;
                         // Support heartbeat/timeout negotiation
                         idle_timeout = *idle_timeout_ms;
+
+                        // --- Capability negotiation (new block) ---
+                        let our_caps = ServerCapabilities::current();
+                        if let Some(required) = required_capabilities {
+                            let missing = required.unsupported_by(&our_caps);
+                            if !missing.is_empty() {
+                                let response = DebugMessage::response(
+                                    message.id,
+                                    DebugResponse::IncompatibleCapabilities {
+                                        message: format!(
+                                            "Server does not support required capabilities: {}. \
+                                             Upgrade the server or disable these features on the client.",
+                                            missing.join(", ")
+                                        ),
+                                        missing_capabilities: missing.iter().map(|s| s.to_string()).collect(),
+                                        server_capabilities: our_caps,
+                                    },
+                                );
+                                send_msg(response)?;
+                                return Ok(());
+                            }
+                        }
+                        // --- end capability negotiation ---
 
                         if let Some(interval) = *heartbeat_interval_ms {
                             info!("Negotiated heartbeat interval: {}ms", interval);
@@ -401,6 +439,7 @@ impl DebugServer {
                                 session_label: session_ctx.info.label.clone(),
                                 heartbeat_interval_ms: *heartbeat_interval_ms,
                                 idle_timeout_ms: idle_timeout,
+                                reconnect_id: Some(self.session_id.clone()),
                             },
                         );
                         send_msg(response)?;
@@ -595,7 +634,7 @@ impl DebugServer {
                     Ok(bytes) => {
                         match crate::runtime::executor::ContractExecutor::new(bytes.clone()) {
                             Ok(executor) => {
-                                let mut engine = DebuggerEngine::new(executor, Vec::new());
+                                let mut engine = DebuggerEngine::new(executor, vec![], vec![]);
                                 if !self.mock_specs.is_empty() {
                                     if let Err(e) =
                                         engine.executor_mut().set_mock_specs(&self.mock_specs)
@@ -1344,6 +1383,7 @@ impl DebugServer {
                                 condition: breakpoint.condition.clone(),
                                 hit_condition: breakpoint.hit_condition.clone(),
                                 log_message: breakpoint.log_message.clone(),
+                                hit_count: breakpoint.hit_count,
                             })
                             .collect(),
                     },
