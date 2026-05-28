@@ -1421,7 +1421,7 @@ pub enum RemoteAction {
     Inspect,
 
     /// Get contract storage state as JSON
-    Storage,
+    Storage(RemoteStorageArgs),
 
     /// Evaluate an expression in the current debug context
     Evaluate(RemoteEvaluateArgs),
@@ -1436,6 +1436,16 @@ pub struct RemoteEvaluateArgs {
     /// Stack frame ID for evaluation context (optional)
     #[arg(long)]
     pub frame_id: Option<u64>,
+}
+
+#[derive(Parser)]
+pub struct RemoteStorageArgs {
+    /// Filter storage output by key pattern (repeatable). Supports:
+    ///   prefix*       — match keys starting with prefix
+    ///   re:<regex>    — match keys by regex
+    ///   exact_key     — match key exactly
+    #[arg(long, value_name = "PATTERN")]
+    pub storage_filter: Vec<String>,
 }
 
 #[derive(Parser)]
