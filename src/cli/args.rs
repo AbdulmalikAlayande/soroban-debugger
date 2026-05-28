@@ -87,6 +87,16 @@ pub enum SnapshotCompression {
     Zstd,
 }
 
+/// Minimum severity level for security findings.
+/// Used with the `analyze` command to filter results by severity.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum, Default)]
+pub enum MinSeverity {
+    #[default]
+    Low,
+    Medium,
+    High,
+}
+
 impl Verbosity {
     /// Convert verbosity to log level string for RUST_LOG
     pub fn to_log_level(self) -> String {
@@ -755,7 +765,7 @@ pub struct OptimizeArgs {
 
 #[cfg(test)]
 mod tests {
-    use super::{Cli, Commands, OutputFormat, SymbolicProfile};
+    use super::{Cli, Commands, OutputFormat, SymbolicProfile, MinSeverity};
     use clap::Parser;
 
     #[test]
@@ -1457,8 +1467,8 @@ pub struct AnalyzeArgs {
     pub disable_rule: Vec<String>,
 
     /// Minimum severity to include: low, medium, or high.
-    #[arg(long, default_value = "low", value_name = "SEVERITY")]
-    pub min_severity: String,
+    #[arg(long, value_enum, default_value_t = MinSeverity::Low)]
+    pub min_severity: MinSeverity,
 }
 
 #[derive(Parser)]
