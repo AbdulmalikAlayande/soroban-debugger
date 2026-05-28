@@ -87,6 +87,16 @@ pub enum SnapshotCompression {
     Zstd,
 }
 
+/// Minimum severity level for security findings.
+/// Used with the `analyze` command to filter results by severity.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum, Default)]
+pub enum MinSeverity {
+    #[default]
+    Low,
+    Medium,
+    High,
+}
+
 impl Verbosity {
     /// Convert verbosity to log level string for RUST_LOG
     pub fn to_log_level(self) -> String {
@@ -149,6 +159,10 @@ pub struct Cli {
 
     #[command(subcommand)]
     pub command: Option<Commands>,
+
+    /// Pretty-print JSON outputs instead of compact JSON
+    #[arg(long, global = true)]
+    pub pretty: bool,
 
     /// Show detailed version information
     #[arg(long)]
@@ -751,7 +765,7 @@ pub struct OptimizeArgs {
 
 #[cfg(test)]
 mod tests {
-    use super::{Cli, Commands, OutputFormat, SymbolicProfile};
+    use super::{Cli, Commands, OutputFormat, SymbolicProfile, MinSeverity};
     use clap::Parser;
 
     #[test]
@@ -1055,7 +1069,6 @@ mod tests {
         assert_eq!(args.trace_file.to_str().unwrap(), "trace.json");
     }
 }
-}
 
 #[derive(Parser)]
 pub struct CompareArgs {
@@ -1080,6 +1093,10 @@ pub struct CompareArgs {
     /// Repeatable. Useful for timestamps, sequence numbers, and similar metadata.
     #[arg(long, value_name = "FIELD")]
     pub ignore_field: Vec<String>,
+
+    /// Output format for the comparison report (pretty or json)
+    #[arg(long, value_enum, default_value_t = OutputFormat::Pretty)]
+    pub format: OutputFormat,
 }
 
 /// Arguments for the TUI dashboard subcommand
@@ -1256,6 +1273,10 @@ pub struct ReplayArgs {
     #[arg(short, long)]
     pub output: Option<PathBuf>,
 
+    /// Output format for replay command (pretty, json)
+    #[arg(long, value_enum, default_value_t = OutputFormat::Pretty)]
+    pub format: OutputFormat,
+
     /// Show verbose output during replay
     #[arg(short, long)]
     pub verbose: bool,
@@ -1278,6 +1299,12 @@ pub struct ServerArgs {
     /// Authentication token (optional, if not provided no auth required)
     #[arg(short, long)]
     pub token: Option<String>,
+
+    /// Enforce the token-strength policy: reject startup if the auth token is
+    /// shorter than 16 characters instead of only warning. Recommended in
+    /// production; a random 32-byte token is ideal.
+    #[arg(long)]
+    pub require_strong_token: bool,
 
     /// TLS certificate file path (optional)
     #[arg(long)]
@@ -1405,6 +1432,10 @@ pub struct RemoteArgs {
     #[arg(long, value_name = "MS", default_value = "2000")]
     pub retry_max_delay_ms: u64,
 
+    /// Output format for remote command (pretty, json)
+    #[arg(long, value_enum, default_value_t = OutputFormat::Pretty)]
+    pub format: OutputFormat,
+
     /// Remote operation to perform (default: execute or ping)
     #[command(subcommand)]
     pub action: Option<RemoteAction>,
@@ -1416,7 +1447,7 @@ pub enum RemoteAction {
     Inspect,
 
     /// Get contract storage state as JSON
-    Storage,
+    Storage(RemoteStorageArgs),
 
     /// Evaluate an expression in the current debug context
     Evaluate(RemoteEvaluateArgs),
@@ -1431,6 +1462,16 @@ pub struct RemoteEvaluateArgs {
     /// Stack frame ID for evaluation context (optional)
     #[arg(long)]
     pub frame_id: Option<u64>,
+}
+
+#[derive(Parser)]
+pub struct RemoteStorageArgs {
+    /// Filter storage output by key pattern (repeatable). Supports:
+    ///   prefix*       — match keys starting with prefix
+    ///   re:<regex>    — match keys by regex
+    ///   exact_key     — match key exactly
+    #[arg(long, value_name = "PATTERN")]
+    pub storage_filter: Vec<String>,
 }
 
 #[derive(Parser)]
@@ -1468,8 +1509,8 @@ pub struct AnalyzeArgs {
     pub disable_rule: Vec<String>,
 
     /// Minimum severity to include: low, medium, or high.
-    #[arg(long, default_value = "low", value_name = "SEVERITY")]
-    pub min_severity: String,
+    #[arg(long, value_enum, default_value_t = MinSeverity::Low)]
+    pub min_severity: MinSeverity,
 }
 
 #[derive(Parser)]
