@@ -487,7 +487,8 @@ fn run_batch(args: &RunArgs, batch_file: &std::path::Path) -> Result<()> {
     logging::log_contract_loaded(wasm_bytes.len());
 
     print_info(format!("Loading batch file: {:?}", batch_file));
-    let batch_items = crate::batch::BatchExecutor::load_batch_file(batch_file)?;
+    let batch_items = crate::batch::BatchExecutor::load_batch_file(batch_file)
+        .with_context(|| format!("Failed to parse batch file {:?}. Expected a JSON array of objects, where each object contains an 'args' string field (and optional 'expected' or 'label' string fields).", batch_file))?;
     print_success(format!("Loaded {} test cases", batch_items.len()));
 
     if let Some(snapshot_path) = &args.network_snapshot {
