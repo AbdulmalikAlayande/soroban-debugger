@@ -268,7 +268,7 @@ pub enum Commands {
     #[command(subcommand_help_heading = "Developer Utilities")]
     PluginInspect(PluginInspectArgs),
 
-    /// Report runtime health and diagnostics for troubleshooting
+    /// Report runtime health and diagnostics for troubleshooting, manpage drift
     Doctor(DoctorArgs),
 
     /// Plugin-provided subcommand (loaded at runtime)
