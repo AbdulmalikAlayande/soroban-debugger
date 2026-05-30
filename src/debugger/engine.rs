@@ -212,6 +212,16 @@ impl DebuggerEngine {
         self.source_map.as_ref()?.lookup(wasm_offset)
     }
 
+    fn check_repeated_pause(&mut self) -> Result<()> {
+        if self.stepper.pause_repeat_count() >= 5 {
+            self.stepper.reset_pause_count();
+            return Err(miette::miette!(
+                "Repeated identical pause state detected (no progress). If this is intentional, you may issue the continue or step command again."
+            ));
+        }
+        Ok(())
+    }
+
     /// Enable instruction-level debugging.
     pub fn enable_instruction_debug(&mut self, wasm_bytes: &[u8]) -> Result<()> {
         self.try_load_source_map(wasm_bytes);
@@ -387,6 +397,7 @@ impl DebuggerEngine {
             if let Ok(state) = self.state.lock() {
                 state.call_stack().display();
             }
+            self.check_repeated_pause()?;
         }
 
         result
@@ -536,6 +547,9 @@ impl DebuggerEngine {
                 state.set_pause_reason(PauseReason::EndOfExecution);
             }
         }
+        if stepped {
+            self.check_repeated_pause()?;
+        }
         Ok(stepped)
     }
 
@@ -558,6 +572,9 @@ impl DebuggerEngine {
                 state.set_pause_reason(PauseReason::EndOfExecution);
             }
         }
+        if stepped {
+            self.check_repeated_pause()?;
+        }
         Ok(stepped)
     }
 
@@ -579,6 +596,9 @@ impl DebuggerEngine {
             } else {
                 state.set_pause_reason(PauseReason::EndOfExecution);
             }
+        }
+        if stepped {
+            self.check_repeated_pause()?;
         }
         Ok(stepped)
     }
@@ -608,6 +628,9 @@ impl DebuggerEngine {
                 state.set_pause_reason(PauseReason::EndOfExecution);
             }
         }
+        if paused {
+            self.check_repeated_pause()?;
+        }
         Ok(StepOverResult { paused, location })
     }
 
@@ -630,6 +653,9 @@ impl DebuggerEngine {
                 state.set_pause_reason(PauseReason::EndOfExecution);
             }
         }
+        if stepped {
+            self.check_repeated_pause()?;
+        }
         Ok(stepped)
     }
 
@@ -651,6 +677,9 @@ impl DebuggerEngine {
             } else {
                 state.set_pause_reason(PauseReason::EndOfExecution);
             }
+        }
+        if stepped {
+            self.check_repeated_pause()?;
         }
         Ok(stepped)
     }
