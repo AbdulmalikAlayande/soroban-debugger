@@ -70,6 +70,11 @@ When in instruction stepping mode, the following commands are available:
 - `c`, `continue` - Continue execution until completion
 - `q`, `quit`, `exit` - Exit instruction stepping mode
 
+### Loop Guard (Repeated Pause Detection)
+
+If the debugger repeatedly pauses at the exact same instruction without making any forward progress (e.g., hitting the same breakpoint infinitely), it will automatically intercept the loop after a threshold (5 repetitions) and warn you.
+You will receive an actionable error suggestion, and if the repeated pauses are intentional, you can simply issue your step or continue command again to proceed for another cycle.
+
 ### Example Session
 
 ```

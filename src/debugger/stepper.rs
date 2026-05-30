@@ -9,6 +9,8 @@ pub struct Stepper {
     active: bool,
     step_mode: StepMode,
     pause_next: bool,
+    last_pause_triple: Option<(usize, usize, StepMode)>,
+    pause_repeat_count: usize,
 }
 
 impl Stepper {
@@ -17,6 +19,8 @@ impl Stepper {
             active: false,
             step_mode: StepMode::StepInto,
             pause_next: false,
+            last_pause_triple: None,
+            pause_repeat_count: 0,
         }
     }
 
@@ -41,13 +45,42 @@ impl Stepper {
         self.step_mode
     }
 
+    pub fn pause_repeat_count(&self) -> usize {
+        self.pause_repeat_count
+    }
+
+    pub fn reset_pause_count(&mut self) {
+        self.pause_repeat_count = 0;
+    }
+
+    fn track_pause(&mut self, debug_state: &DebugState) {
+        if let Some(inst) = debug_state.current_instruction() {
+            let current_triple = (
+                inst.offset,
+                debug_state.instruction_pointer().call_stack_depth(),
+                self.step_mode,
+            );
+
+            if self.last_pause_triple == Some(current_triple) {
+                self.pause_repeat_count += 1;
+            } else {
+                self.last_pause_triple = Some(current_triple);
+                self.pause_repeat_count = 0;
+            }
+        }
+    }
+
     pub fn step_into(&mut self, debug_state: &mut DebugState) -> bool {
         if !self.active {
             return false;
         }
         self.step_mode = StepMode::StepInto;
         debug_state.start_instruction_stepping(StepMode::StepInto);
-        debug_state.next_instruction().is_some()
+        let stepped = debug_state.next_instruction().is_some();
+        if stepped {
+            self.track_pause(debug_state);
+        }
+        stepped
     }
 
     pub fn step_over(&mut self, debug_state: &mut DebugState) -> bool {
@@ -56,7 +89,11 @@ impl Stepper {
         }
         self.step_mode = StepMode::StepOver;
         debug_state.start_instruction_stepping(StepMode::StepOver);
-        self.advance_to_depth(debug_state, false)
+        let stepped = self.advance_to_depth(debug_state, false);
+        if stepped {
+            self.track_pause(debug_state);
+        }
+        stepped
     }
 
     /// Step over to the next distinct source line within the same call frame.
@@ -96,6 +133,7 @@ impl Stepper {
             };
 
             if is_different_line {
+                self.track_pause(debug_state);
                 return true;
             }
         }
@@ -109,7 +147,11 @@ impl Stepper {
         }
         self.step_mode = StepMode::StepOut;
         debug_state.start_instruction_stepping(StepMode::StepOut);
-        self.advance_to_depth(debug_state, true)
+        let stepped = self.advance_to_depth(debug_state, true);
+        if stepped {
+            self.track_pause(debug_state);
+        }
+        stepped
     }
 
     pub fn step_block(&mut self, debug_state: &mut DebugState) -> bool {
@@ -118,14 +160,22 @@ impl Stepper {
         }
         self.step_mode = StepMode::StepBlock;
         debug_state.start_instruction_stepping(StepMode::StepBlock);
-        self.find_next_control_flow(debug_state)
+        let stepped = self.find_next_control_flow(debug_state);
+        if stepped {
+            self.track_pause(debug_state);
+        }
+        stepped
     }
 
     pub fn step_back(&mut self, debug_state: &mut DebugState) -> bool {
         if !self.active {
             return false;
         }
-        debug_state.previous_instruction().is_some()
+        let stepped = debug_state.previous_instruction().is_some();
+        if stepped {
+            self.track_pause(debug_state);
+        }
+        stepped
     }
 
     pub fn continue_execution(&mut self, debug_state: &mut DebugState) {
@@ -155,6 +205,7 @@ impl Stepper {
             return false;
         }
         if self.should_pause(instruction, debug_state) {
+            self.track_pause(debug_state);
             self.pause_next = false;
             return true;
         }
@@ -164,6 +215,8 @@ impl Stepper {
     pub fn reset(&mut self) {
         self.active = false;
         self.pause_next = false;
+        self.last_pause_triple = None;
+        self.pause_repeat_count = 0;
     }
 
     fn advance_to_depth(&self, debug_state: &mut DebugState, strictly_lower: bool) -> bool {
